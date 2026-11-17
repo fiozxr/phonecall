@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { callerInstructions, callerTools, simulatedCalleeInstructions, summaryPrompt } from "./prompt";
+import { apiKey, acceptCall, chatCompletionsUrl, defaultSummaryModel, defaultVoice, providerDefault, providerOf, realtimeCallUrl, realtimeWsUrl, sipUri, type VoiceProviderName } from "./providers";
 import type { Env, Job, JobEvent, JobStatus, Question, Report } from "./types";
 
 const TERMINAL = new Set(["completed", "busy", "no-answer", "failed", "canceled"]);
@@ -17,6 +18,7 @@ export interface StartInput {
   maxMinutes?: number;
   answerTimeoutSec?: number;
   simulate?: string;
+  provider?: VoiceProviderName;
 }
 
 type Answer = { question: string; answer: string | null; note?: string };
@@ -97,13 +99,15 @@ export class CallJob extends DurableObject<Env> {
   async start(input: StartInput): Promise<{ ok: true } | { error: string }> {
     if (this.job) return { error: "job already exists" };
     const env = this.env;
+    const provider = input.provider ?? providerDefault(env);
     this.job = {
       id: input.id,
       to: input.to,
       brief: input.brief,
       principal: input.principal || env.PRINCIPAL_NAME || "",
       agentName: input.agentName || env.AGENT_NAME || "Sam",
-      voice: input.voice || env.VOICE || "eve",
+      voice: input.voice || env.VOICE || defaultVoice(provider),
+      provider,
       maxMinutes: clamp(input.maxMinutes ?? 10, 1, 30),
       answerTimeoutSec: clamp(input.answerTimeoutSec ?? 60, 10, 300),
       simulate: input.simulate,
@@ -113,16 +117,21 @@ export class CallJob extends DurableObject<Env> {
     };
     await this.save();
     await this.registry().add(this.job.id, this.job.to, this.job.brief);
-    this.emit("status", { status: "dialing", to: this.job.to, simulated: !!this.job.simulate });
+    this.emit("status", { status: "dialing", to: this.job.to, simulated: !!this.job.simulate, provider });
     // Backstop in case Twilio's final status callback never arrives.
     await this.ctx.storage.setAlarm(Date.now() + (this.job.maxMinutes + 5) * 60_000);
 
-    // When the callee answers, Twilio bridges them to our xAI SIP number; the header tells the webhook which job it is.
-    const agentUri = `sip:${env.TWILIO_PHONE_NUMBER}@sip.voice.x.ai;transport=tls?X-Job-Id=${this.job.id}`;
+    // When the callee answers, Twilio bridges them to the provider's SIP endpoint; the xai URI
+    // carries an X-Job-Id parameter that comes back in the webhook's sip_headers.
+    const agentUri = sipUri(env, this.job);
+    // OpenAI routes by the project id in the URI and needs no digest auth; xAI expects the SIP credentials.
+    const sipElement = provider === "openai"
+      ? `<Sip>${xml(agentUri)}</Sip>`
+      : `<Sip username="${xml(env.SIP_USERNAME)}" password="${xml(env.SIP_PASSWORD)}">${xml(agentUri)}</Sip>`;
     const params = new URLSearchParams({
       From: env.TWILIO_PHONE_NUMBER,
       To: this.job.simulate ? `sip:${env.SIM_NUMBER}@sip.voice.x.ai;transport=tls?X-Sim-Job=${this.job.id}` : this.job.to,
-      Twiml: `<Response><Dial><Sip username="${xml(env.SIP_USERNAME)}" password="${xml(env.SIP_PASSWORD)}">${xml(agentUri)}</Sip></Dial></Response>`,
+      Twiml: `<Response><Dial>${sipElement}</Dial></Response>`,
       StatusCallback: `${this.job.origin}/twilio/status/${this.job.id}`,
       StatusCallbackMethod: "POST",
       Timeout: "30",
@@ -162,21 +171,37 @@ export class CallJob extends DurableObject<Env> {
     await this.save();
   }
 
+  // OpenAI requires the inbound SIP call to be accepted before anything can attach to it.
+  // xAI accepts implicitly, so this is a no-op there.
+  async acceptVoiceCall(callId: string): Promise<{ ok: true } | { error: string }> {
+    if (!this.job) return { error: "unknown job" };
+    if (providerOf(this.job, this.env) !== "openai") return { ok: true };
+    const result = await acceptCall(this.env, this.job, callId);
+    if ("error" in result) {
+      this.emit("error", { message: result.error });
+      return result;
+    }
+    this.emit("debug", { accepted: true });
+    return { ok: true };
+  }
+
   async attach(callId: string, role: "agent" | "sim", sipHeaders: string[]): Promise<{ ok: true } | { error: string }> {
     if (!this.job || this.job.status === "done" || this.job.status === "ended") return { error: "no live job" };
     if (role === "agent" ? this.agent : this.sim) return { error: "already attached" };
     this.emit("debug", { sip_leg: role, sip_headers: sipHeaders });
-    if (role === "agent") this.job.xaiCallId = callId;
+    if (role === "agent") this.job.xaiCallId = callId; // realtime call id (both providers)
     else this.job.simCallId = callId;
     await this.save();
 
-    const res = await fetch(`https://api.x.ai/v1/realtime?call_id=${encodeURIComponent(callId)}`, {
-      headers: { Upgrade: "websocket", Authorization: `Bearer ${this.env.XAI_API_KEY}` },
+    const env = this.env;
+    const provider = providerOf(this.job, env);
+    const res = await fetch(realtimeWsUrl(env, provider, callId), {
+      headers: { Upgrade: "websocket", Authorization: `Bearer ${apiKey(env, provider)}` },
     });
     const ws = res.webSocket;
     if (!ws) {
-      this.emit("error", { message: `xAI realtime connect failed (${role}): ${res.status} ${(await res.text()).slice(0, 200)}` });
-      return { error: "xai connect failed" };
+      this.emit("error", { message: `${provider} realtime connect failed (${role}): ${res.status} ${(await res.text()).slice(0, 200)}` });
+      return { error: "realtime connect failed" };
     }
     ws.accept();
     if (role === "agent") {
@@ -288,6 +313,7 @@ export class CallJob extends DurableObject<Env> {
   private onAgentEvent(e: any) {
     // Events still buffered after the call ended were never heard by anyone.
     if (!this.job || this.job.status === "ended" || this.job.status === "done") return;
+    const provider = providerOf(this.job, this.env);
     switch (e.type) {
       case "response.created":
         this.responseActive = true;
@@ -308,6 +334,7 @@ export class CallJob extends DurableObject<Env> {
       }
       case "conversation.item.added": {
         // xAI puts the caller's transcript on the committed user item; there is no separate transcription event.
+        if (provider === "openai") break; // OpenAI reports it on its own transcription event instead
         const item = e.item ?? {};
         if (item.role !== "user" || item.type !== "message") break;
         const text = (item.content ?? [])
@@ -315,6 +342,12 @@ export class CallJob extends DurableObject<Env> {
           .map((c: any) => c.transcript ?? "")
           .join(" ")
           .trim();
+        if (text) this.emit("said", { who: "them", text });
+        break;
+      }
+      case "conversation.item.input_audio_transcription.completed": {
+        if (provider !== "openai") break;
+        const text = typeof e.transcript === "string" ? e.transcript.trim() : "";
         if (text) this.emit("said", { who: "them", text });
         break;
       }
@@ -340,7 +373,7 @@ export class CallJob extends DurableObject<Env> {
       default:
         if (!this.seenTypes.has(e.type)) {
           this.seenTypes.add(e.type);
-          this.emit("debug", { xai_event: e.type, sample: JSON.stringify(e).slice(0, 300) });
+          this.emit("debug", { event: e.type, sample: JSON.stringify(e).slice(0, 300) });
         }
     }
   }
@@ -423,9 +456,10 @@ export class CallJob extends DurableObject<Env> {
     const job = this.job;
     if (!job) return;
     if (job.xaiCallId) {
-      const res = await fetch(`https://api.x.ai/v1/realtime/calls/${job.xaiCallId}/hangup`, {
+      const provider = providerOf(job, this.env);
+      const res = await fetch(realtimeCallUrl(provider, job.xaiCallId, "hangup"), {
         method: "POST",
-        headers: { Authorization: `Bearer ${this.env.XAI_API_KEY}` },
+        headers: { Authorization: `Bearer ${apiKey(this.env, provider)}` },
       });
       if (res.ok) return;
     }
@@ -484,12 +518,13 @@ export class CallJob extends DurableObject<Env> {
     const questions = this.questions()
       .map((q) => `- ${q.question} → ${q.answer ?? "(no answer)"}`)
       .join("\n");
+    const provider = providerOf(job, this.env);
     try {
-      const res = await fetch("https://api.x.ai/v1/chat/completions", {
+      const res = await fetch(chatCompletionsUrl(provider), {
         method: "POST",
-        headers: { Authorization: `Bearer ${this.env.XAI_API_KEY}`, "Content-Type": "application/json" },
+        headers: { Authorization: `Bearer ${apiKey(this.env, provider)}`, "Content-Type": "application/json" },
         body: JSON.stringify({
-          model: this.env.SUMMARY_MODEL || "grok-4.7",
+          model: defaultSummaryModel(this.env, provider),
           messages: [{ role: "user", content: summaryPrompt(job, lines.join("\n"), questions) }],
           response_format: { type: "json_object" },
         }),

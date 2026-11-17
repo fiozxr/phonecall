@@ -7,6 +7,12 @@ export interface Env {
   PHONECALL_TOKEN: string;
   XAI_API_KEY: string;
   XAI_WEBHOOK_SECRET: string;
+  // Multi-provider support: "xai" (default) or "openai".
+  VOICE_PROVIDER?: string;
+  OPENAI_API_KEY?: string;
+  OPENAI_PROJECT_ID?: string;
+  OPENAI_WEBHOOK_SECRET?: string;
+  OPENAI_REALTIME_MODEL?: string;
   SIP_USERNAME: string;
   SIP_PASSWORD: string;
   TWILIO_ACCOUNT_SID: string;
@@ -34,6 +40,8 @@ export interface Job {
   answerTimeoutSec: number;
   // Persona for a simulated callee; when set, the call goes to a second Grok agent instead of a phone.
   simulate?: string;
+  // Which voice provider runs the call. Absent on jobs stored before multi-provider support (defaults to xai).
+  provider?: "xai" | "openai";
   origin: string;
   status: JobStatus;
   createdAt: number;

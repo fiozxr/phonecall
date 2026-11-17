@@ -1,3 +1,4 @@
+import { webhookSecret, type VoiceProviderName } from "./providers";
 import { CallJob } from "./call-job";
 import { job, registry, startJob } from "./jobs";
 import { handleMcp } from "./mcp";
@@ -21,18 +22,28 @@ export default {
       return new Response(null, { status: 204 });
     }
 
-    if (root === "xai" && a === "webhook" && req.method === "POST") {
+    if ((root === "xai" || root === "openai") && a === "webhook" && req.method === "POST") {
+      const provider = root as VoiceProviderName;
       const body = await req.text();
-      if (!(await verifyStandardWebhook(env.XAI_WEBHOOK_SECRET, req.headers, body))) return new Response("bad signature", { status: 403 });
+      const secret = webhookSecret(env, provider);
+      if (!secret || !(await verifyStandardWebhook(secret, req.headers, body))) return new Response("bad signature", { status: 403 });
       const event = JSON.parse(body);
       if (event.type !== "realtime.call.incoming") return new Response(null, { status: 204 });
       const headers: { name: string; value: string }[] = event.data?.sip_headers ?? [];
       const header = (name: string) => headers.find((h) => h.name.toLowerCase() === name.toLowerCase())?.value;
-      const simJob = header("X-Sim-Job");
-      const role = simJob || (env.SIM_NUMBER && header("To")?.includes(env.SIM_NUMBER)) ? "sim" : "agent";
+      const simJob = provider === "xai" ? header("X-Sim-Job") : undefined;
+      const role = simJob || (provider === "xai" && env.SIM_NUMBER && header("To")?.includes(env.SIM_NUMBER)) ? "sim" : "agent";
+      // xAI echoes X-Job-Id back from the SIP URI; OpenAI's URI is fixed per project, so fall back
+      // to the most recent unaccepted live job. Concurrent outbound calls may attach to each other.
       const jobId = role === "sim" ? simJob : (header("X-Job-Id") ?? (await registry(env).unattached()));
       if (!jobId) return json({ error: "no job for this call" }, 404);
-      ctx.waitUntil(job(env, jobId).attach(event.data.call_id, role, headers.map((h) => h.name)));
+      const stub = job(env, jobId);
+      if (role === "agent" && provider === "openai") {
+        // OpenAI won't connect the call until it is accepted with the session config (xAI accepts implicitly).
+        const accepted = await stub.acceptVoiceCall(event.data.call_id);
+        if ("error" in accepted) return json({ error: accepted.error }, 502);
+      }
+      ctx.waitUntil(stub.attach(event.data.call_id, role, headers.map((h) => h.name)));
       return new Response(null, { status: 204 });
     }
 

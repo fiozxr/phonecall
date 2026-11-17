@@ -50,7 +50,12 @@ Stick to what is in that brief. Once it is done, or clearly can't be done on thi
 
 export function callerTools(principal: string) {
   return [
-    { type: "function", name: "send_dtmf" },
+    {
+      type: "function",
+      name: "send_dtmf",
+      description: "Press keys on the phone keypad, e.g. to navigate a recorded menu. The tones are sent by the backend.",
+      parameters: { type: "object", properties: {} },
+    },
     {
       type: "function",
       name: "request_input",

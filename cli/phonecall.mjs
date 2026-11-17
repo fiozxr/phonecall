@@ -19,10 +19,11 @@ call options
   --brief <text> | --brief-file <path>   goal, facts it may share, limits, what counts as done
   --for <name>             who the call is for (default: the server's PRINCIPAL_NAME)
   --as <name>              name the caller gives (default: Sam)
-  --voice <id>             eve, ara, rex, sal or leo (default: eve)
+  --voice <id>             voice for the provider in use (xai: eve, ara, rex, sal, leo; openai: marin, cedar, …)
   --max-minutes <n>        hard limit on call length (default 10)
   --answer-timeout <sec>   how long the caller waits for a reply to a question (default 60)
-  --simulate <persona>     test call: a second AI plays the person you're calling; nobody is dialed
+  --simulate <persona>     test call: a second AI plays the person you're calling; nobody is dialed (xai only)
+  --provider <name>        which voice provider runs the call: xai (default) or openai
   --watch                  start watching right away
 
 watch prints live progress to stderr and exits with one JSON line on stdout:
@@ -116,6 +117,7 @@ const { values: opt, positionals: pos } = parseArgs({
     "max-minutes": { type: "string" },
     "answer-timeout": { type: "string" },
     simulate: { type: "string" },
+    provider: { type: "string" },
     watch: { type: "boolean" },
     verbose: { type: "boolean", short: "v" },
     limit: { type: "string" },
@@ -136,6 +138,7 @@ switch (cmd) {
       max_minutes: opt["max-minutes"] ? Number(opt["max-minutes"]) : undefined,
       answer_timeout: opt["answer-timeout"] ? Number(opt["answer-timeout"]) : undefined,
       simulate: opt.simulate,
+      provider: opt.provider,
     });
     if (opt.watch) {
       console.error(`job ${r.job_id}`);
