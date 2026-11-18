@@ -23,6 +23,12 @@ export interface Env {
   DEEPGRAM_THINK_TEMPERATURE?: string;
   DEEPGRAM_TTS_MODEL?: string;
   DEEPGRAM_SUMMARY_MODEL?: string;
+  // Gemini Live API (google provider). Free tier for the native Live models; content may be
+  // used to improve Google's products on the free tier.
+  GOOGLE_API_KEY?: string;
+  GOOGLE_LIVE_MODEL?: string;
+  GOOGLE_VOICE?: string;
+  GOOGLE_SUMMARY_MODEL?: string;
   SIP_USERNAME: string;
   SIP_PASSWORD: string;
   TWILIO_ACCOUNT_SID: string;
@@ -51,7 +57,7 @@ export interface Job {
   // Persona for a simulated callee; when set, the call goes to a second Grok agent instead of a phone.
   simulate?: string;
   // Which voice provider runs the call. Absent on jobs stored before multi-provider support (defaults to xai).
-  provider?: "xai" | "openai" | "deepgram";
+  provider?: "xai" | "openai" | "deepgram" | "google";
   origin: string;
   status: JobStatus;
   createdAt: number;

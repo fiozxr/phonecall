@@ -4,17 +4,17 @@ import type { Env, Job } from "./types";
 // Voice providers plug in here. Two families:
 //   - SIP bridge (xai, openai): Twilio <Dial><Sip> connects the call provider-side; the
 //     Worker only manages the realtime sideband WebSocket and the job lifecycle.
-//   - Media stream (deepgram): Twilio <Connect><Stream> opens a WebSocket to *this* Worker,
-//     which relays mulaw/8kHz audio to Deepgram's Voice Agent (STT+LLM+TTS) and back.
-export type VoiceProviderName = "xai" | "openai" | "deepgram";
+//   - Media stream (deepgram, google): Twilio <Connect><Stream> opens a WebSocket to *this* Worker,
+//     which relays phone audio to the Voice Agent / Live API and back.
+export type VoiceProviderName = "xai" | "openai" | "deepgram" | "google";
 
 export function isVoiceProvider(v: unknown): v is VoiceProviderName {
-  return v === "xai" || v === "openai" || v === "deepgram";
+  return v === "xai" || v === "openai" || v === "deepgram" || v === "google";
 }
 
 export function providerDefault(env: Env): VoiceProviderName {
   const p = (env.VOICE_PROVIDER ?? "").trim().toLowerCase();
-  return p === "openai" ? "openai" : p === "deepgram" ? "deepgram" : "xai";
+  return p === "openai" ? "openai" : p === "deepgram" ? "deepgram" : p === "google" ? "google" : "xai";
 }
 
 // `provider` is optional on stored jobs so calls written before multi-provider support keep working.
@@ -23,12 +23,13 @@ export function providerOf(job: Job | null | undefined, env: Env): VoiceProvider
 }
 
 export function isMediaStreamProvider(name: VoiceProviderName): boolean {
-  return name === "deepgram";
+  return name === "deepgram" || name === "google";
 }
 
 export function defaultVoice(name: VoiceProviderName): string {
   if (name === "openai") return "marin";
   if (name === "deepgram") return "flux-kit-en";
+  if (name === "google") return "Kore";
   return "eve";
 }
 
@@ -36,6 +37,7 @@ export function apiKey(env: Env, name: VoiceProviderName): string {
   switch (name) {
     case "openai": return env.OPENAI_API_KEY ?? "";
     case "deepgram": return env.DEEPGRAM_API_KEY ?? "";
+    case "google": return env.GOOGLE_API_KEY ?? "";
     default: return env.XAI_API_KEY;
   }
 }
@@ -114,6 +116,36 @@ export function deepgramSettings(env: Env, job: Job): Record<string, unknown> {
   };
 }
 
+// ---- Gemini Live API (media-stream provider) ----
+
+// Gemini Live speaks raw PCM16 (16kHz in / 24kHz out). The Worker transcodes mulaw/8kHz from
+// Twilio in and out (src/audio.ts). Transcriptions are requested both ways so the transcript
+// path matches the other providers.
+export function googleSettings(env: Env, job: Job): Record<string, unknown> {
+  const model = (env.GOOGLE_LIVE_MODEL ?? "").trim() || "gemini-3.8-live";
+  // Gemini functionDeclarations take {name, description, parameters}; blocking semantics keep
+  // tool turns deterministic (check_messages stays open until it gets its response).
+  const functionDeclarations = callerTools(job.principal).map(({ type: _t, ...rest }) => ({
+    ...rest,
+    behavior: "BLOCKING",
+  }));
+  return {
+    setup: {
+      model: model.startsWith("models/") ? model : `models/${model}`,
+      responseModalities: ["AUDIO"],
+      systemInstruction: { parts: [{ text: callerInstructions(job) }] },
+      speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: job.voice || "Kore" } } },
+      inputAudioTranscription: {},
+      outputAudioTranscription: {},
+      tools: [{ functionDeclarations }],
+    },
+  };
+}
+
+export function googleWsUrl(env: Env): string {
+  return `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(env.GOOGLE_API_KEY ?? "")}`;
+}
+
 export function chatCompletionsUrl(name: VoiceProviderName): string {
   return name === "openai" ? "https://api.openai.com/v1/chat/completions" : "https://api.x.ai/v1/chat/completions";
 }
@@ -125,7 +157,9 @@ export function defaultSummaryModel(env: Env, name: VoiceProviderName): string {
 // Deepgram manages no chat-completions endpoint of its own, so the post-call summary reuses the
 // BYO think endpoint when one is configured, then falls back to OpenAI if a key is present.
 // Neither available → null, and the report ships as transcript + a note instead of an LLM summary.
+// (xai/openai/google resolve their summary inline; google uses generateContent with its own key.)
 export function summaryConfig(env: Env, job: Job): { url: string; auth: string; model: string } | null {
+  if (providerOf(job, env) === "google") return null;
   if (providerOf(job, env) !== "deepgram") {
     const name = providerOf(job, env);
     return { url: chatCompletionsUrl(name), auth: `Bearer ${apiKey(env, name)}`, model: defaultSummaryModel(env, name) };

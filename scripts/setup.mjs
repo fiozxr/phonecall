@@ -3,8 +3,8 @@
 // Works for all voice providers:
 //   xai      (default) registers the Twilio number with xAI's SIP service; simulated test calls work
 //   openai             no registration needed; you create the OpenAI webhook by hand (the script tells you how)
-//   deepgram           no registration needed; STT/TTS run on Deepgram, and you can plug your own
-//                      OpenAI-compatible LLM (including a local model via a tunnel) as the brain
+//   deepgram           no registration needed; STT/TTS run on Deepgram, and you can plug your own OpenAI-compatible LLM as the brain
+//   google             Gemini Live API: free tier for the Live models; you'll need an API key from AI Studio
 // Values can come from environment variables of the same name; anything missing is asked for.
 import { spawnSync } from "node:child_process";
 import { randomBytes, randomInt } from "node:crypto";
@@ -30,8 +30,8 @@ function fail(message) {
   process.exit(1);
 }
 
-const provider = (process.env.VOICE_PROVIDER?.trim().toLowerCase() || (await rl.question("Voice provider, xai, openai or deepgram [xai]: ")).trim().toLowerCase() || "xai");
-if (provider !== "xai" && provider !== "openai" && provider !== "deepgram") fail("provider must be xai, openai or deepgram");
+const provider = (process.env.VOICE_PROVIDER?.trim().toLowerCase() || (await rl.question("Voice provider, xai, openai, deepgram or google [xai]: ")).trim().toLowerCase() || "xai");
+if (!["xai", "openai", "deepgram", "google"].includes(provider)) fail("provider must be xai, openai, deepgram or google");
 if (provider !== "xai" && simulate && !process.argv.includes("--no-sim")) {
   console.error("Note: --simulate is only supported by the xai provider; simulation will not be set up.");
 }
@@ -92,6 +92,17 @@ The brain is an LLM of your choice — leave empty to use Deepgram's managed Ope
   const tts = process.env.DEEPGRAM_TTS_MODEL?.trim();
   if (tts) secrets.DEEPGRAM_TTS_MODEL = tts;
   rl.close();
+} else if (provider === "google") {
+  const googleKey = await value("GOOGLE_API_KEY", "Google API key from aistudio.google.com/api-keys (the Live models are free of charge)");
+  secrets.GOOGLE_API_KEY = googleKey;
+  const model = process.env.GOOGLE_LIVE_MODEL?.trim();
+  if (model) secrets.GOOGLE_LIVE_MODEL = model;
+  const voice = process.env.GOOGLE_VOICE?.trim();
+  if (voice) secrets.GOOGLE_VOICE = voice;
+  rl.close();
+  console.error("");
+  console.error("Note: the Google free tier is rate-limited and content is used to improve Google's products");
+  console.error("(see Gemini API terms). Calls longer than ~15 minutes will end the session.");
 } else {
   const xaiKey = await value("XAI_API_KEY", "xAI API key");
   rl.close();
@@ -167,26 +178,39 @@ for (const [name, content] of [
   chmodSync(join(configDir, name), 0o600);
 }
 
+let tryIt = "";
+if (provider === "xai") {
+  tryIt = `
+Try a simulated call (nobody is dialed):
+  phonecall call --simulate "You run the counter at a busy pizza place." \\
+    --brief "Order a large pepperoni for pickup at 7pm." --watch`;
+} else {
+  const notes = {
+    openai: `OpenAI Realtime is doing the talking. Override the model with
+  OPENAI_REALTIME_MODEL (default gpt-realtime-2.1-mini/2.1) and the voice with --voice.`,
+    deepgram: `Deepgram is doing the listening and the talking. The brain:
+  - managed OpenAI (default): nothing else to set
+  - your own endpoint: set DEEPGRAM_THINK_ENDPOINT_URL / DEEPGRAM_THINK_MODEL / DEEPGRAM_THINK_API_KEY
+    (e.g. Groq's free tier, OpenRouter, or a tunnel to your local Ollama — see README)
+  - summaries after the call: reuses the think endpoint, or OPENAI_API_KEY as fallback;
+    set DEEPGRAM_SUMMARY_MODEL to override`,
+    google: `Google's Gemini Live API is doing the listening and the talking (free tier).
+Override with:
+  - GOOGLE_LIVE_MODEL (default gemini-3.8-live, e.g. gemini-3.1-flash-live-preview)
+  - GOOGLE_VOICE (default Kore; native-audio voices incl. Puck, Charon, Kore, Fenrir, Aoede)`,
+  }[provider];
+  tryIt = `
+Try a test call:
+  phonecall call +1XXXXXXXXXX --watch \\
+    --brief "Book a table for 2 at 7pm tonight."
+
+${notes}`;
+}
+
 console.log(`
 Done. phonecall is live at ${url} (provider: ${provider})
 
 CLI config: ~/.config/phonecall/config.json
 MCP token:  ~/.config/phonecall/token
-${provider === "xai" ? `
-Try a simulated call (nobody is dialed):
-  phonecall call --simulate "You run the counter at a busy pizza place." \\
-    --brief "Order a large pepperoni for pickup at 7pm." --watch` : provider === "openai" ? `
-Try a test call:
-  phonecall call +1XXXXXXXXXX --watch \\
-    --brief "Book a table for 2 at 7pm tonight."` : `
-Try a test call:
-  phonecall call +1XXXXXXXXXX --watch \\
-    --brief "Book a table for 2 at 7pm tonight."
-
-Deepgram is doing the listening and the talking. The brain:
-  - managed OpenAI (default): nothing else to set
-  - your own endpoint: set DEEPGRAM_THINK_ENDPOINT_URL / DEEPGRAM_THINK_MODEL / DEEPGRAM_THINK_API_KEY
-    (e.g. Groq's free tier, OpenRouter, or a tunnel to your local Ollama — see README)
-  - summaries after the call: reuses the think endpoint, or OPENAI_API_KEY as fallback;
-    set DEEPGRAM_SUMMARY_MODEL to override`}
+${tryIt}
 `);

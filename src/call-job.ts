@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { callerInstructions, callerTools, simulatedCalleeInstructions, summaryPrompt } from "./prompt";
-import { apiKey, acceptCall, summaryConfig, deepgramSettings, isMediaStreamProvider, providerDefault, providerOf, realtimeCallUrl, realtimeWsUrl, sipUri, defaultVoice, type VoiceProviderName } from "./providers";
+import { Downsampler3x1, bytesToPcm16, mulawToPcm16, pcm16ToBytes, pcm16ToMulaw } from "./audio";
+import { apiKey, acceptCall, summaryConfig, deepgramSettings, googleSettings, googleWsUrl, isMediaStreamProvider, providerDefault, providerOf, realtimeCallUrl, realtimeWsUrl, sipUri, defaultVoice, type VoiceProviderName } from "./providers";
 import type { Env, Job, JobEvent, JobStatus, Question, Report } from "./types";
 
 const TERMINAL = new Set(["completed", "busy", "no-answer", "failed", "canceled"]);
@@ -38,10 +39,11 @@ export class CallJob extends DurableObject<Env> {
   job: Job | null = null;
   agent: WebSocket | null = null;
   sim: WebSocket | null = null;
-  // Media-stream pipeline (deepgram provider): Twilio <-> this DO <-> Deepgram Voice Agent.
+  // Media-stream pipeline (deepgram, google): Twilio <-> this DO <-> provider.
   twilioWs: WebSocket | null = null;
   streamSid: string | null = null;
-  deepgram: WebSocket | null = null;
+  providerWs: WebSocket | null = null;
+  downsampler: Downsampler3x1 | null = null;
   settingsApplied = false;
   prebuffer: Uint8Array[] = [];
   // A check_messages call whose response is held until the principal answers an open question.
@@ -114,8 +116,8 @@ export class CallJob extends DurableObject<Env> {
     if (this.job) return { error: "job already exists" };
     const env = this.env;
     const provider = input.provider ?? providerDefault(env);
-    // env.VOICE is xai/openai-specific; deepgram's voice is the Flux TTS model id.
-    const fallbackVoice = provider === "deepgram" ? env.DEEPGRAM_TTS_MODEL || "flux-kit-en" : env.VOICE || defaultVoice(provider);
+    // env.VOICE is xai/openai-specific; deepgram's voice is the Flux TTS model id, google's the Gemini voice.
+    const fallbackVoice = provider === "deepgram" ? env.DEEPGRAM_TTS_MODEL || "flux-kit-en" : provider === "google" ? env.GOOGLE_VOICE || "Kore" : env.VOICE || defaultVoice(provider);
     this.job = {
       id: input.id,
       to: input.to,
@@ -139,10 +141,10 @@ export class CallJob extends DurableObject<Env> {
 
     // Twilio connects the callee to the provider once they answer.
     // SIP bridges (xai, openai) use <Dial><Sip>; the xai URI carries an X-Job-Id parameter that
-    // comes back in the webhook's sip_headers. Deepgram uses a bidirectional <Connect><Stream>
-    // WebSocket straight to this Worker, which relays audio to the Voice Agent API.
+    // comes back in the webhook's sip_headers. Media-stream providers (deepgram, google) use a
+    // bidirectional <Connect><Stream> WebSocket straight to this Worker, which relays the audio.
     let twiml: string;
-    if (provider === "deepgram") {
+    if (isMediaStreamProvider(provider)) {
       twiml = `<Response><Connect><Stream url="${xml(`${this.job.origin}/twilio/media/${this.job.id}`)}"/></Connect></Response>`;
     } else {
       const agentUri = sipUri(env, this.job);
@@ -210,9 +212,11 @@ export class CallJob extends DurableObject<Env> {
   }
 
   // Twilio <Connect><Stream> opens a bidirectional WebSocket to /twilio/media/<job-id>.
-  // This Worker is the media relay for the deepgram provider: mulaw/8kHz both ways, no transcoding.
+  // This Worker is the media relay for the media-stream providers: mulaw/8kHz both ways.
   async fetch(request: Request): Promise<Response> {
-    if (!this.job || providerOf(this.job, this.env) !== "deepgram") return new Response("unknown job", { status: 404 });
+    if (!this.job) return new Response("unknown job", { status: 404 });
+    const provider = providerOf(this.job, this.env);
+    if (!isMediaStreamProvider(provider)) return new Response("unknown job", { status: 404 });
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") return new Response("expected websocket upgrade", { status: 426 });
     const env = this.env;
     const pair = new WebSocketPair();
@@ -225,26 +229,43 @@ export class CallJob extends DurableObject<Env> {
       this.streamSid = null;
     });
 
-    const res = await fetch("wss://agent.deepgram.com/v1/agent/converse", {
-      headers: { Upgrade: "websocket", Authorization: `Token ${env.DEEPGRAM_API_KEY}` },
-    });
+    const res =
+      provider === "google"
+        ? await fetch(googleWsUrl(env), { headers: { Upgrade: "websocket" } })
+        : await fetch("wss://agent.deepgram.com/v1/agent/converse", {
+            headers: { Upgrade: "websocket", Authorization: `Token ${env.DEEPGRAM_API_KEY}` },
+          });
     const dg = res.webSocket;
     if (!dg) {
       const detail = (await res.text()).slice(0, 200);
-      this.emit("error", { message: `deepgram connect failed: ${res.status} ${detail}` });
-      server.close(1011, "deepgram connect failed");
-      return new Response("deepgram connect failed", { status: 502 });
+      this.emit("error", { message: `${provider} connect failed: ${res.status} ${detail}` });
+      server.close(1011, "provider connect failed");
+      return new Response(`${provider} connect failed`, { status: 502 });
     }
-    this.deepgram = dg;
+    this.providerWs = dg;
     dg.accept();
-    dg.addEventListener("message", (m: { data: string | ArrayBuffer }) => this.onDeepgramEvent(m));
+    if (provider === "google") {
+      this.downsampler = new Downsampler3x1();
+      try {
+        send(dg, googleSettings(env, this.job!));
+      } catch (err) {
+        this.emit("error", { message: `google configuration invalid: ${String(err).slice(0, 200)}` });
+        server.close(1011, "bad setup");
+        dg.close(1000, "bad setup");
+        return new Response("google configuration invalid", { status: 502 });
+      }
+    }
+    dg.addEventListener("message", (m: { data: string | ArrayBuffer }) => (provider === "google" ? this.onGoogleEvent(m) : this.onDeepgramEvent(m)));
     dg.addEventListener("close", (e: { code: number }) => {
-      this.deepgram = null;
+      this.providerWs = null;
       this.settingsApplied = false;
       this.emit("status", { status: "voice_session_closed", code: e.code });
+      // If the provider dropped first (crash, session limit), hang up the phone leg too —
+      // otherwise the callee is stuck on a silent line until Twilio's TimeLimit.
+      if (this.twilioWs && this.job && this.job.status !== "done" && this.job.status !== "ended") this.ctx.waitUntil(this.endCall());
     });
     await this.registry().update(this.job.id, { attached: true });
-    this.emit("debug", { media: "twilio<->deepgram" });
+    this.emit("debug", { media: `twilio<->${provider}` });
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -271,7 +292,7 @@ export class CallJob extends DurableObject<Env> {
         const payload = msg.media?.payload;
         if (typeof payload !== "string") break;
         const bytes = b64decode(payload);
-        if (this.deepgram && this.settingsApplied) this.deepgram.send(bytes.buffer as ArrayBuffer);
+        if (this.providerWs && this.settingsApplied) this.sendAudioToProvider(bytes);
         else if (this.prebuffer.length < 200) this.prebuffer.push(bytes);
         break;
       }
@@ -282,11 +303,24 @@ export class CallJob extends DurableObject<Env> {
         break;
       case "stop":
         try {
-          this.deepgram?.close(1000, "call ended");
+          this.providerWs?.close(1000, "call ended");
         } catch {}
-        this.deepgram = null;
+        this.providerWs = null;
+        this.downsampler = null;
         break;
     }
+  }
+
+  // Twilio audio (mulaw/8kHz) -> provider-native framing.
+  private sendAudioToProvider(mulaw: Uint8Array) {
+    if (!this.providerWs) return;
+    if (providerOf(this.job, this.env) === "google") {
+      // Declare rate=8000 and let Gemini resample; just decode mulaw -> PCM16 LE.
+      const pcm = mulawToPcm16(mulaw);
+      send(this.providerWs, { realtimeInput: { audio: { data: b64encode(pcm16ToBytes(pcm)), mimeType: "audio/pcm;rate=8000" } } });
+      return;
+    }
+    this.providerWs.send(mulaw.buffer as ArrayBuffer);
   }
 
   private onDeepgramEvent(m: { data: string | ArrayBuffer }) {
@@ -304,21 +338,21 @@ export class CallJob extends DurableObject<Env> {
     switch (e.type) {
       case "Welcome": {
         try {
-          send(this.deepgram!, deepgramSettings(this.env, this.job!));
+          send(this.providerWs!, deepgramSettings(this.env, this.job!));
         } catch (err) {
           this.emit("error", { message: `deepgram configuration invalid: ${String(err).slice(0, 200)}` });
           try {
             this.twilioWs?.close(1011, "bad settings");
           } catch {}
           try {
-            this.deepgram?.close(1000, "bad settings");
+            this.providerWs?.close(1000, "bad settings");
           } catch {}
         }
         break;
       }
       case "SettingsApplied":
         this.settingsApplied = true;
-        for (const bytes of this.prebuffer) this.deepgram?.send(bytes.buffer as ArrayBuffer);
+        for (const bytes of this.prebuffer) this.sendAudioToProvider(bytes);
         this.prebuffer = [];
         break;
       case "Settings":
@@ -382,9 +416,92 @@ export class CallJob extends DurableObject<Env> {
     }
   }
 
-  // Deepgram function responses: the agent continues the turn once it receives this message.
-  private deepgramOutput(fc: { id: string; name: string }, result: unknown) {
-    send(this.deepgram, { type: "FunctionCallResponse", id: fc.id, name: fc.name, content: JSON.stringify(result) });
+  // Gemini Live message surface (setupComplete, serverContent, toolCall, toolCallCancellation).
+  private onGoogleEvent(m: { data: string | ArrayBuffer }) {
+    if (typeof m.data !== "string") return; // Gemini sends only JSON text frames
+    let e: any;
+    try {
+      e = JSON.parse(m.data);
+    } catch {
+      return;
+    }
+    if (e.setupComplete !== undefined) {
+      this.settingsApplied = true;
+      for (const bytes of this.prebuffer) this.sendAudioToProvider(bytes);
+      this.prebuffer = [];
+      return;
+    }
+    if (e.toolCall) {
+      for (const fc of e.toolCall.functionCalls ?? []) {
+        this.onTool(fc.name, fc.id, JSON.stringify(fc.args ?? {}));
+      }
+      return;
+    }
+    if (e.toolCallCancellation) {
+      for (const id of e.toolCallCancellation.ids ?? []) {
+        if (this.pendingCheck?.id === id) this.pendingCheck = null;
+      }
+      return;
+    }
+    if (e.error) {
+      this.emit("error", { message: `google: ${e.error.message ?? JSON.stringify(e.error).slice(0, 300)}` });
+      return;
+    }
+    const sc = e.serverContent;
+    if (sc) {
+      // The callee's audio arrives base64-encoded as 24kHz PCM16 inside the model turn.
+      if (sc.modelTurn?.parts) {
+        for (const part of sc.modelTurn.parts) {
+          const b64 = part?.inlineData?.data;
+          if (typeof b64 !== "string") continue;
+          const pcm = bytesToPcm16(b64decode(b64));
+          if (!this.downsampler) this.downsampler = new Downsampler3x1();
+          const pcm8k = this.downsampler.process(pcm);
+          const mulaw = pcm16ToMulaw(pcm8k);
+          if (this.twilioWs && this.streamSid) {
+            this.toTwilio({ event: "media", streamSid: this.streamSid, media: { payload: b64encode(mulaw) } });
+          }
+        }
+      }
+      // VAD interruption: the callee started talking over the agent — stop playback now.
+      if (sc.interrupted === true) {
+        this.userSpeaking = true;
+        if (this.twilioWs && this.streamSid) this.toTwilio({ event: "clear", streamSid: this.streamSid });
+      }
+      if (sc.inputTranscription?.text) {
+        // Gemini sends transcription deltas per message (same order as audio), like the SDK examples log them.
+        const text = String(sc.inputTranscription.text).trim();
+        if (text) this.emit("said", { who: "them", text });
+      }
+      if (sc.outputTranscription?.text) {
+        const text = String(sc.outputTranscription.text).trim();
+        if (text) {
+          this.emit("said", { who: "agent", text });
+          this.audioEndsAt = Math.max(this.audioEndsAt, Date.now() + text.length * MS_PER_CHAR);
+        }
+      }
+      if (sc.turnComplete) {
+        this.userSpeaking = false;
+        this.audioEndsAt = Date.now();
+        if (this.hangupPending) this.scheduleHangup();
+      }
+      return;
+    }
+    if (e.usageMetadata) return; // noise; could feed cost tracking later
+    if (!this.seenTypes.has(e.type ?? "unknown")) {
+      this.seenTypes.add(e.type ?? "unknown");
+      this.emit("debug", { google_event: e.type ?? Object.keys(e)[0] });
+    }
+  }
+
+  // Tool responses: the agent continues the turn once it receives this message.
+  private providerToolOutput(fc: { id: string; name: string }, result: unknown) {
+    if (providerOf(this.job!, this.env) === "google") {
+      const response = typeof result === "object" && result !== null && !Array.isArray(result) ? result : { result };
+      send(this.providerWs, { toolResponse: { functionResponses: [{ id: fc.id, name: fc.name, response }] } });
+      return;
+    }
+    send(this.providerWs, { type: "FunctionCallResponse", id: fc.id, name: fc.name, content: JSON.stringify(result) });
   }
 
   async attach(callId: string, role: "agent" | "sim", sipHeaders: string[]): Promise<{ ok: true } | { error: string }> {
@@ -588,7 +705,7 @@ export class CallJob extends DurableObject<Env> {
     // SIP providers need a function_call_output (+ sometimes response.create); deepgram takes one
     // FunctionCallResponse per request id and continues the turn by itself.
     const out = (result: unknown, respond: boolean) =>
-      isMedia ? this.deepgramOutput({ id: callId, name }, result) : this.output(callId, result, respond);
+      isMedia ? this.providerToolOutput({ id: callId, name }, result) : this.output(callId, result, respond);
     let args: Record<string, string> = {};
     try {
       args = JSON.parse(argsJson || "{}");
@@ -651,7 +768,7 @@ export class CallJob extends DurableObject<Env> {
       // Deepgram can't be given a synthetic tool call; answer a check_messages we're holding open instead.
       if (this.pendingCheck && this.queue.length) {
         const answers = this.queue.splice(0);
-        this.deepgramOutput(this.pendingCheck, { answers });
+        this.providerToolOutput(this.pendingCheck, { answers });
         this.pendingCheck = null;
       }
       return;
@@ -683,17 +800,18 @@ export class CallJob extends DurableObject<Env> {
     if (!job) return;
     if (isMediaStreamProvider(providerOf(job, this.env))) {
       // Twilio REST hangup (below) is the signalling path; closing the bridge triggers Twilio 'stop'.
-      for (const ws of [this.deepgram, this.twilioWs]) {
+      for (const ws of [this.providerWs, this.twilioWs]) {
         try {
           ws?.close(1000, "call ended");
         } catch {}
       }
-      this.deepgram = null;
+      this.providerWs = null;
       this.twilioWs = null;
       this.settingsApplied = false;
       this.prebuffer = [];
       this.pendingCheck = null;
       this.streamSid = null;
+      this.downsampler = null;
     }
     if (job.xaiCallId) {
       const provider = providerOf(job, this.env);
@@ -727,12 +845,13 @@ export class CallJob extends DurableObject<Env> {
       job.endedAt = Date.now();
       this.setStatus("ended", { reason });
       if (this.openerTimer) clearTimeout(this.openerTimer);
-      for (const ws of [this.agent, this.sim, this.deepgram, this.twilioWs]) {
+      for (const ws of [this.agent, this.sim, this.providerWs, this.twilioWs]) {
         try {
           ws?.close(1000, "call ended");
         } catch {}
       }
-      this.agent = this.sim = this.deepgram = this.twilioWs = null;
+      this.agent = this.sim = this.providerWs = this.twilioWs = null;
+      this.downsampler = null;
       this.ctx.storage.sql.exec(`UPDATE questions SET status = 'timed_out' WHERE status = 'pending'`);
       job.report = await this.summarize(reason);
       await this.save();
@@ -758,11 +877,33 @@ export class CallJob extends DurableObject<Env> {
     const questions = this.questions()
       .map((q) => `- ${q.question} → ${q.answer ?? "(no answer)"}`)
       .join("\n");
-    const summary = summaryConfig(this.env, job);
-    if (!summary) {
-      return empty(job.endCall?.outcome ?? "partial", `Summary skipped (no summary LLM configured: set DEEPGRAM_THINK_ENDPOINT_URL/DEEPGRAM_THINK_MODEL or OPENAI_API_KEY). Agent note: ${job.endCall?.notes ?? "none"}`);
-    }
+    const provider = providerOf(job, this.env);
     try {
+      if (provider === "google") {
+        const model = this.env.GOOGLE_SUMMARY_MODEL || "gemini-2.5-flash";
+        const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+          method: "POST",
+          headers: { "x-goog-api-key": this.env.GOOGLE_API_KEY ?? "", "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ role: "user", parts: [{ text: summaryPrompt(job, lines.join("\n"), questions) }] }],
+            generationConfig: { responseMimeType: "application/json" },
+          }),
+        });
+        const body = await res.json<any>();
+        const text: string = body?.candidates?.[0]?.content?.parts?.map((p: any) => p?.text ?? "").join("") ?? "";
+        const parsed = JSON.parse(text);
+        return {
+          outcome: parsed.outcome ?? job.endCall?.outcome ?? "partial",
+          summary: parsed.summary ?? "",
+          details: parsed.details ?? {},
+          commitments: parsed.commitments ?? [],
+          follow_ups: parsed.follow_ups ?? [],
+        };
+      }
+      const summary = summaryConfig(this.env, job);
+      if (!summary) {
+        return empty(job.endCall?.outcome ?? "partial", `Summary skipped (no summary LLM configured: set DEEPGRAM_THINK_ENDPOINT_URL/DEEPGRAM_THINK_MODEL or OPENAI_API_KEY). Agent note: ${job.endCall?.notes ?? "none"}`);
+      }
       const res = await fetch(summary.url, {
         method: "POST",
         headers: { Authorization: summary.auth, "Content-Type": "application/json" },

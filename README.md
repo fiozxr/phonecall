@@ -9,7 +9,7 @@ Let your agent make phone calls. A Grok Voice agent places the call through Twil
 You need:
 
 - a Cloudflare account
-- an [xAI API key](https://console.x.ai) (default provider), an OpenAI API key with Realtime API access, or a [Deepgram API key](https://console.deepgram.com/signup) ($200 free credit)
+- an [xAI API key](https://console.x.ai) (default provider), an OpenAI API key with Realtime API access, a [Deepgram API key](https://console.deepgram.com/signup) ($200 free credit), or a [Google AI Studio key](https://aistudio.google.com/api-keys) (Live models free of charge)
 - a Twilio account with a voice number (trial accounts can only call verified numbers)
 - Node 20 or later
 
@@ -72,17 +72,17 @@ An agent calls `phonecall_start`, then calls `phonecall_watch` repeatedly. What 
 
 ## Voice providers
 
-Three providers ship in the box. Pick one per call with `--provider` (CLI/MCP) or set the default with the `VOICE_PROVIDER` secret (`xai` is the default).
+Four providers ship in the box. Pick one per call with `--provider` (CLI/MCP) or set the default with the `VOICE_PROVIDER` secret (`xai` is the default).
 
-| | xAI (default) | OpenAI Realtime | Deepgram Voice Agent |
-| --- | --- | --- | --- |
-| Dial path | Twilio `<Dial><Sip>` to xAI's SIP | Twilio `<Dial><Sip>` to OpenAI's SIP (`sip:<project-id>@sip.api.openai.com`) | Twilio `<Connect><Stream>` WebSocket to this Worker, relayed to Deepgram Flux (STT+TTS) |
-| Setup | `npm run setup` registers the number with xAI and creates the sim number | `npm run setup` asks for your OpenAI key, project ID and the signing secret of a `realtime.call.incoming` webhook you create by hand (it prints the exact URL) | `npm run setup` asks for your Deepgram key ($200 free credit, no card) + optional LLM endpoint |
-| Bring your own LLM | no | no | **yes** — `agent.think.endpoint` accepts any OpenAI-compatible URL (see below) |
-| Voices | `eve`, `ara`, `rex`, `sal`, `leo` | `marin` (default), `cedar`, `alloy`, `ash`, `ballad`, `coral`, `echo`, `sage`, `shimmer`, `verse` | Flux TTS models, e.g. `flux-kit-en` (default) |
-| Test calls | `--simulate` against a second Grok (free of real phones) | not supported — no registered-number SIP API | not supported — no registered-number SIP API |
-| Summary model | `grok-4.7` | `gpt-5-mini` | reuses the BYO think endpoint, else `OPENAI_API_KEY`, else transcript-only report |
-| Cost | Grok Voice ~$0.08/min | Pay-as-you-go; new accounts get $5 free credit. `gpt-realtime-2.1` is ~$0.2+/min depending on turn sizes; `gpt-realtime-2.1-mini` is considerably cheaper (override with `OPENAI_REALTIME_MODEL`). Check the [OpenAI pricing page](https://developers.openai.com/api/docs/pricing) (correct as of Nov 2026). | Flux STT+TTS on your $200 credit; tokens for the brain are billed to whichever LLM you point it at (Deepgram-managed OpenAI, or free on Groq) |
+| | xAI (default) | OpenAI Realtime | Deepgram Voice Agent | Google Gemini Live |
+| --- | --- | --- | --- | --- |
+| Dial path | Twilio `<Dial><Sip>` to xAI's SIP | Twilio `<Dial><Sip>` to OpenAI's SIP (`sip:<project-id>@sip.api.openai.com`) | Twilio `<Connect><Stream>` WebSocket to this Worker, relayed to Deepgram Flux (STT+TTS) | Twilio `<Connect><Stream>` WebSocket to this Worker, relayed to Gemini Live (PCM16 in/out, Worker transcodes) |
+| Setup | `npm run setup` registers the number with xAI and creates the sim number | `npm run setup` asks for your OpenAI key, project ID and the signing secret of a `realtime.call.incoming` webhook you create by hand (it prints the exact URL) | `npm run setup` asks for your Deepgram key ($200 free credit, no card) + optional LLM endpoint | `npm run setup` asks for your Google AI Studio key — Live models are **free of charge** |
+| Bring your own LLM | no | no | **yes** — `agent.think.endpoint` accepts any OpenAI-compatible URL (see below) | no (native audio model does the thinking) |
+| Voices | `eve`, `ara`, `rex`, `sal`, `leo` | `marin` (default), `cedar`, `alloy`, `ash`, `ballad`, `coral`, `echo`, `sage`, `shimmer`, `verse` | Flux TTS models, e.g. `flux-kit-en` (default) | Gemini native-audio voices, e.g. `Kore` (default), `Puck`, `Charon`, `Fenrir`, `Aoede` |
+| Test calls | `--simulate` against a second Grok (free of real phones) | not supported — no registered-number SIP API | not supported — no registered-number SIP API | not supported — no registered-number SIP API |
+| Summary model | `grok-4.7` | `gpt-5-mini` | reuses the BYO think endpoint, else `OPENAI_API_KEY`, else transcript-only report | `gemini-2.5-flash` (or `GOOGLE_SUMMARY_MODEL`) |
+| Cost | Grok Voice ~$0.08/min | Pay-as-you-go; new accounts get $5 free credit. `gpt-realtime-2.1` is ~$0.2+/min depending on turn sizes; `gpt-realtime-2.1-mini` is considerably cheaper (override with `OPENAI_REALTIME_MODEL`). Check the [OpenAI pricing page](https://developers.openai.com/api/docs/pricing) (correct as of Nov 2026). | Flux STT+TTS on your $200 credit; tokens for the brain are billed to whichever LLM you point it at (Deepgram-managed OpenAI, or free on Groq) | $0 on the free tier (rate-limited; content used to improve Google's products). Audio-only sessions limited to ~15 min |
 
 ### OpenAI setup
 
@@ -101,6 +101,13 @@ Caveats:
 1. Grab an API key at [console.deepgram.com](https://console.deepgram.com/signup) — $200 free credit, no card.
 2. Run `npm run setup`, pick `deepgram`, paste the key. Optionally point the brain at your own LLM (see below) or press enter for Deepgram-managed OpenAI models.
 3. No webhook or registration needed; the status callbacks Twilio already sends are all the Worker uses to track the call.
+
+### Google (Gemini Live API) setup
+
+1. Create a key at [aistudio.google.com/api-keys](https://aistudio.google.com/api-keys) — the native Live models (`gemini-3.8-live`, `gemini-3.1-flash-live-preview`) are **free of charge** on the free tier.
+2. Run `npm run setup`, pick `google`, paste the key.
+3. No webhook or registration needed; the audio pipeline works like Deepgram's — mulaw/8kHz from Twilio, PCM16 into/out of Gemini (the Worker transcodes and resamples).
+4. Notes: free tier is rate-limited, content is used to improve Google's products (see Gemini API terms), and audio-only sessions are limited to ~15 minutes.
 
 ### Bring your own (or local) LLM — the "api + base URL" option
 
@@ -142,10 +149,10 @@ Notes:
 
 - `--for` sets who the call is for.
 - `--as` sets the caller's name (default Sam).
-- `--voice` sets the voice for the provider in use (default `eve` for xai, `marin` for openai, `flux-kit-en` for deepgram).
+- `--voice` sets the voice for the provider in use (default `eve` for xai, `marin` for openai, `flux-kit-en` for deepgram, `Kore` for google).
 - `--max-minutes` caps the call length (default 10).
 - `--answer-timeout` sets how many seconds the caller waits for an answer (default 60).
-- `--provider` picks `xai` (default), `openai` or `deepgram`.
+- `--provider` picks `xai` (default), `openai`, `deepgram` or `google`.
 
 ## Writing a brief
 
@@ -168,10 +175,10 @@ Anything outside the brief turns into a question for you. The caller never makes
 
 ## How it works
 
-- Twilio dials the number. On SIP-bridge providers (xai, openai), TwiML `<Dial><Sip>` connects the call to the provider's SIP endpoint. For xAI, an `X-Job-Id` SIP URI parameter tells the Worker which job the call belongs to; for OpenAI, the project-scoped SIP URI carries no job token, so the webhook matches the newest unaccepted live job. On deepgram, TwiML `<Connect><Stream>` opens a bidirectional mulaw/8kHz WebSocket from Twilio to the Worker, which relays the audio to Deepgram's Voice Agent API and back — no SIP, and the caller's transcript arrives as `ConversationText` messages.
-- A Durable Object per call joins the call over the provider's realtime WebSocket (Grok Voice for xAI, GPT Realtime for OpenAI) or the media-stream bridge (deepgram). It gives the voice agent a prompt (`src/prompt.ts`) and four tools: `send_dtmf`, `request_input`, `check_messages` and `end_call`. OpenAI calls must first be accepted with `POST /v1/realtime/calls/{call_id}/accept` (the Worker does this before attaching). For deepgram, the agent emits `FunctionCallRequest`s and waits — a `check_messages` call with no answer yet is held open until your reply (or the answer timeout).
+- Twilio dials the number. On SIP-bridge providers (xai, openai), TwiML `<Dial><Sip>` connects the call to the provider's SIP endpoint. For xAI, an `X-Job-Id` SIP URI parameter tells the Worker which job the call belongs to; for OpenAI, the project-scoped SIP URI carries no job token, so the webhook matches the newest unaccepted live job. On media-stream providers (deepgram, google), TwiML `<Connect><Stream>` opens a bidirectional WebSocket from Twilio to the Worker, which relays the audio to the provider and back. Deepgram gets raw mulaw frames; Gemini Live wants PCM16 (16kHz in / 24kHz out), so the Worker decodes mulaw and resamples.
+- A Durable Object per call joins the call over the provider's realtime WebSocket (Grok Voice for xAI, GPT Realtime for OpenAI) or the media-stream bridge (deepgram, google). It gives the voice agent a prompt (`src/prompt.ts`) and four tools: `send_dtmf`, `request_input`, `check_messages` and `end_call`. OpenAI calls must first be accepted with `POST /v1/realtime/calls/{call_id}/accept` (the Worker does this before attaching). For deepgram, the agent emits `FunctionCallRequest`s and waits — a `check_messages` call with no answer yet is held open until your reply (or the answer timeout). For google, the same holds over `toolCall`/`toolResponse` with synchronous function calling.
 - Questions go to whoever is watching. Answers reach the voice agent as a `check_messages` tool result, which it relays straight away.
-- When Twilio reports that the call has ended, the configured summary model (Grok 4.7 for xAI, `gpt-5-mini` for OpenAI, or the BYO/OpenAI endpoint for deepgram) writes the report from the transcript.
+- When Twilio reports that the call has ended, the configured summary model (Grok 4.7 for xAI, `gpt-5-mini` for OpenAI, the BYO/OpenAI endpoint for deepgram, `gemini-2.5-flash` for google) writes the report from the transcript.
 - Simulated calls dial a second xAI SIP number, where another Grok session plays the other side. That number comes from the fictional 555-0100 to 555-0199 range, so it can't be a real line. Simulated calls need the xai provider.
 
 ## Configuration
@@ -186,19 +193,21 @@ Anything outside the brief turns into a question for you. The caller never makes
 | `PRINCIPAL_NAME` | Who calls are made for, by default |
 | `PHONECALL_TOKEN` | The bearer token for the API, CLI and MCP |
 | `SIP_USERNAME`, `SIP_PASSWORD`, `XAI_WEBHOOK_SECRET`, `SIM_NUMBER` | Created by setup for the xAI SIP connection (xai provider) |
-| `VOICE_PROVIDER` | `xai` (default), `openai` or `deepgram` |
+| `VOICE_PROVIDER` | `xai` (default), `openai`, `deepgram` or `google` |
 | `OPENAI_API_KEY`, `OPENAI_PROJECT_ID`, `OPENAI_WEBHOOK_SECRET` | Your OpenAI key, project ID (`proj_…`) and webhook signing secret (openai provider) |
 | `DEEPGRAM_API_KEY` | Your Deepgram key (deepgram provider; new accounts get $200 free, no card) |
 | `DEEPGRAM_THINK_ENDPOINT_URL`, `DEEPGRAM_THINK_API_KEY`, `DEEPGRAM_THINK_MODEL` | Optional: bring your own OpenAI-compatible LLM as the brain (see "Bring your own/local LLM" below) |
 | `DEEPGRAM_STT_MODEL`, `DEEPGRAM_TTS_MODEL`, `DEEPGRAM_SUMMARY_MODEL`, `DEEPGRAM_THINK_TEMPERATURE` | Optional defaults (`flux-general-en`, `flux-kit-en`) |
+| `GOOGLE_API_KEY` | Your AI Studio key (google provider; free tier for the Live models) |
+| `GOOGLE_LIVE_MODEL`, `GOOGLE_VOICE`, `GOOGLE_SUMMARY_MODEL` | Optional defaults (`gemini-3.8-live`, `Kore`, `gemini-2.5-flash`) |
 
-You can also set `AGENT_NAME`, `VOICE`, `SUMMARY_MODEL`, `OPENAI_REALTIME_MODEL` (default `gpt-realtime-2.1`) and `DEEPGRAM_TTS_MODEL` with `npx wrangler secret put` to change the defaults (`Sam`, provider-specific default voice, `grok-4.7`/`gpt-5-mini`).
+You can also set `AGENT_NAME`, `VOICE`, `SUMMARY_MODEL`, `OPENAI_REALTIME_MODEL` (default `gpt-realtime-2.1`), `DEEPGRAM_TTS_MODEL`, `GOOGLE_LIVE_MODEL` and `GOOGLE_VOICE` with `npx wrangler secret put` to change the defaults (`Sam`, provider-specific default voice, `grok-4.7`/`gpt-5-mini`/`gemini-2.5-flash`).
 
 Running `npm run setup` again replaces the xAI registration and SIP credentials. It makes a new API token unless `PHONECALL_TOKEN` is set in your environment. Run `npm run setup -- --no-sim` to skip the simulator number.
 
 ## Good to know
 
-- A call costs about $0.10 a minute on xAI (Grok Voice $0.08 + Twilio ~$0.02). OpenAI Realtime is ~$0.2+/min depending on model and turn size. Deepgram is the cheapest: Flux STT+TTS on your $200 free credit plus whatever LLM you use for "thinking" (free on Groq).
+- A call costs about $0.10 a minute on xAI (Grok Voice $0.08 + Twilio ~$0.02). OpenAI Realtime is ~$0.2+/min depending on model and turn size. Deepgram is the cheapest S2S-ish option: Flux STT+TTS on your $200 free credit plus whatever LLM you use for "thinking" (free on Groq). **Google is the only $0 one**: the Gemini Live models are free on the AI Studio tier (rate-limited; content improves Google's products). Simulated calls remain xai-only.
 - The caller never claims to be human. If someone asks, it says it's an AI assistant.
 - Rules on AI calls vary by place. For example, the FCC treats AI voices as artificial voices under the TCPA. Check the rules that apply to you before calling people.
 - Setup leaves your Twilio number's incoming-call settings alone. Calls back to that number go wherever they went before.

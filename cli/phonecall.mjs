@@ -19,11 +19,11 @@ call options
   --brief <text> | --brief-file <path>   goal, facts it may share, limits, what counts as done
   --for <name>             who the call is for (default: the server's PRINCIPAL_NAME)
   --as <name>              name the caller gives (default: Sam)
-  --voice <id>             voice for the provider in use (xai: eve, ara, rex, sal, leo; openai: marin, cedar, …)
+  --voice <id>             voice for the provider in use (xai: eve, ara, rex, sal, leo; openai: marin, cedar, …; google: Kore, Puck, Charon, …; deepgram: flux-kit-en, …)
   --max-minutes <n>        hard limit on call length (default 10)
   --answer-timeout <sec>   how long the caller waits for a reply to a question (default 60)
   --simulate <persona>     test call: a second AI plays the person you're calling; nobody is dialed (xai only)
-  --provider <name>        which voice provider runs the call: xai (default), openai or deepgram
+  --provider <name>        which voice provider runs the call: xai (default), openai, deepgram or google
   --watch                  start watching right away
 
 watch prints live progress to stderr and exits with one JSON line on stdout:

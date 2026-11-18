@@ -27,10 +27,10 @@ export async function startJob(env: Env, origin: string, input: StartRequest): P
   const simulate = typeof input.simulate === "string" && input.simulate.trim() ? input.simulate.trim() : undefined;
   if (!simulate && !E164.test(input.to ?? "")) return { error: "to must be an E.164 number like +14155550100", status: 400 };
   if (typeof input.provider === "string" && input.provider.trim() && !isVoiceProvider(input.provider.trim().toLowerCase())) {
-    return { error: "provider must be `xai`, `openai` or `deepgram`", status: 400 };
+    return { error: "provider must be `xai`, `openai`, `deepgram` or `google`", status: 400 };
   }
   const provider: VoiceProviderName = input.provider?.trim() ? (input.provider.trim().toLowerCase() as VoiceProviderName) : providerDefault(env);
-  if (simulate && provider !== "xai") return { error: "simulated calls need the xai provider (neither OpenAI nor Deepgram has a registered-number SIP API to dial)", status: 400 };
+  if (simulate && provider !== "xai") return { error: "simulated calls need the xai provider (none of the other providers has a registered-number SIP API to dial)", status: 400 };
   if (simulate && !env.SIM_NUMBER) return { error: "simulated calls need a SIM_NUMBER; run npm run setup again with simulation on", status: 400 };
   if (provider === "openai") {
     if (!env.OPENAI_API_KEY) return { error: "the openai provider needs OPENAI_API_KEY (run npm run setup)", status: 400 };
@@ -40,6 +40,9 @@ export async function startJob(env: Env, origin: string, input: StartRequest): P
   if (provider === "deepgram") {
     if (!env.DEEPGRAM_API_KEY) return { error: "the deepgram provider needs DEEPGRAM_API_KEY (free, no card: console.deepgram.com)", status: 400 };
     if (env.DEEPGRAM_THINK_ENDPOINT_URL && !env.DEEPGRAM_THINK_MODEL) return { error: "DEEPGRAM_THINK_ENDPOINT_URL is set but DEEPGRAM_THINK_MODEL is missing — the model name your endpoint expects (e.g. qwen2.5:7b)", status: 400 };
+  }
+  if (provider === "google") {
+    if (!env.GOOGLE_API_KEY) return { error: "the google provider needs GOOGLE_API_KEY (aistudio.google.com/api-keys, free tier for the Live models)", status: 400 };
   }
   if (!input.principal && !env.PRINCIPAL_NAME) return { error: "say who the call is for: pass `for`, or set the PRINCIPAL_NAME secret", status: 400 };
   if (typeof input.brief !== "string" || !input.brief.trim()) return { error: "brief is required", status: 400 };
