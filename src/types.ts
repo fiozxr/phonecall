@@ -7,12 +7,22 @@ export interface Env {
   PHONECALL_TOKEN: string;
   XAI_API_KEY: string;
   XAI_WEBHOOK_SECRET: string;
-  // Multi-provider support: "xai" (default) or "openai".
+  // Multi-provider support: "xai" (default), "openai" or "deepgram".
   VOICE_PROVIDER?: string;
   OPENAI_API_KEY?: string;
   OPENAI_PROJECT_ID?: string;
   OPENAI_WEBHOOK_SECRET?: string;
   OPENAI_REALTIME_MODEL?: string;
+  // Deepgram Voice Agent: STT (Flux) + LLM ("think") + TTS (Flux). The think step can be managed
+  // (Deepgram-billed OpenAI models) or your own OpenAI-compatible endpoint — local models included.
+  DEEPGRAM_API_KEY?: string;
+  DEEPGRAM_STT_MODEL?: string;
+  DEEPGRAM_THINK_ENDPOINT_URL?: string;
+  DEEPGRAM_THINK_API_KEY?: string;
+  DEEPGRAM_THINK_MODEL?: string;
+  DEEPGRAM_THINK_TEMPERATURE?: string;
+  DEEPGRAM_TTS_MODEL?: string;
+  DEEPGRAM_SUMMARY_MODEL?: string;
   SIP_USERNAME: string;
   SIP_PASSWORD: string;
   TWILIO_ACCOUNT_SID: string;
@@ -41,7 +51,7 @@ export interface Job {
   // Persona for a simulated callee; when set, the call goes to a second Grok agent instead of a phone.
   simulate?: string;
   // Which voice provider runs the call. Absent on jobs stored before multi-provider support (defaults to xai).
-  provider?: "xai" | "openai";
+  provider?: "xai" | "openai" | "deepgram";
   origin: string;
   status: JobStatus;
   createdAt: number;

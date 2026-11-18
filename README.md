@@ -9,7 +9,7 @@ Let your agent make phone calls. A Grok Voice agent places the call through Twil
 You need:
 
 - a Cloudflare account
-- an [xAI API key](https://console.x.ai) (default provider), or an OpenAI API key with Realtime API access
+- an [xAI API key](https://console.x.ai) (default provider), an OpenAI API key with Realtime API access, or a [Deepgram API key](https://console.deepgram.com/signup) ($200 free credit)
 - a Twilio account with a voice number (trial accounts can only call verified numbers)
 - Node 20 or later
 
@@ -72,16 +72,17 @@ An agent calls `phonecall_start`, then calls `phonecall_watch` repeatedly. What 
 
 ## Voice providers
 
-Two providers ship in the box. Pick one per call with `--provider` (CLI/MCP) or set the default with the `VOICE_PROVIDER` secret (`xai` is the default).
+Three providers ship in the box. Pick one per call with `--provider` (CLI/MCP) or set the default with the `VOICE_PROVIDER` secret (`xai` is the default).
 
-| | xAI (default) | OpenAI Realtime |
-| --- | --- | --- |
-| Dial path | Twilio `<Dial><Sip>` to xAI's SIP | Twilio `<Dial><Sip>` to OpenAI's SIP (`sip:<project-id>@sip.api.openai.com`) |
-| Setup | `npm run setup` registers the number with xAI and creates the sim number | `npm run setup` asks for your OpenAI key, project ID and the signing secret of a `realtime.call.incoming` webhook you create by hand (it prints the exact URL) |
-| Voices | `eve`, `ara`, `rex`, `sal`, `leo` | `marin` (default), `cedar`, `alloy`, `ash`, `ballad`, `coral`, `echo`, `sage`, `shimmer`, `verse` |
-| Test calls | `--simulate` against a second Grok (free of real phones) | not supported — OpenAI has no equivalent registered-number SIP API |
-| Summary model | `grok-4.7` | `gpt-5-mini` |
-| Cost | Grok Voice ~$0.08/min | Pay-as-you-go; new accounts get $5 free credit. `gpt-realtime-2.1` is ~$0.2+/min depending on turn sizes; `gpt-realtime-2.1-mini` is considerably cheaper (override with `OPENAI_REALTIME_MODEL`). Check the [OpenAI pricing page](https://developers.openai.com/api/docs/pricing) (correct as of Nov 2026). |
+| | xAI (default) | OpenAI Realtime | Deepgram Voice Agent |
+| --- | --- | --- | --- |
+| Dial path | Twilio `<Dial><Sip>` to xAI's SIP | Twilio `<Dial><Sip>` to OpenAI's SIP (`sip:<project-id>@sip.api.openai.com`) | Twilio `<Connect><Stream>` WebSocket to this Worker, relayed to Deepgram Flux (STT+TTS) |
+| Setup | `npm run setup` registers the number with xAI and creates the sim number | `npm run setup` asks for your OpenAI key, project ID and the signing secret of a `realtime.call.incoming` webhook you create by hand (it prints the exact URL) | `npm run setup` asks for your Deepgram key ($200 free credit, no card) + optional LLM endpoint |
+| Bring your own LLM | no | no | **yes** — `agent.think.endpoint` accepts any OpenAI-compatible URL (see below) |
+| Voices | `eve`, `ara`, `rex`, `sal`, `leo` | `marin` (default), `cedar`, `alloy`, `ash`, `ballad`, `coral`, `echo`, `sage`, `shimmer`, `verse` | Flux TTS models, e.g. `flux-kit-en` (default) |
+| Test calls | `--simulate` against a second Grok (free of real phones) | not supported — no registered-number SIP API | not supported — no registered-number SIP API |
+| Summary model | `grok-4.7` | `gpt-5-mini` | reuses the BYO think endpoint, else `OPENAI_API_KEY`, else transcript-only report |
+| Cost | Grok Voice ~$0.08/min | Pay-as-you-go; new accounts get $5 free credit. `gpt-realtime-2.1` is ~$0.2+/min depending on turn sizes; `gpt-realtime-2.1-mini` is considerably cheaper (override with `OPENAI_REALTIME_MODEL`). Check the [OpenAI pricing page](https://developers.openai.com/api/docs/pricing) (correct as of Nov 2026). | Flux STT+TTS on your $200 credit; tokens for the brain are billed to whichever LLM you point it at (Deepgram-managed OpenAI, or free on Groq) |
 
 ### OpenAI setup
 
@@ -94,6 +95,36 @@ Caveats:
 
 - OpenAI's SIP URI can't carry per-call parameters, so the webhook matches the incoming call to the most recent unaccepted live job. Two outbound calls answered at the same time could attach to each other; the xAI provider keeps the exact `X-Job-Id` matching.
 - Calls are accepted with the same session config the CLI sends, so voice and tools work exactly as with xAI.
+
+### Deepgram setup
+
+1. Grab an API key at [console.deepgram.com](https://console.deepgram.com/signup) — $200 free credit, no card.
+2. Run `npm run setup`, pick `deepgram`, paste the key. Optionally point the brain at your own LLM (see below) or press enter for Deepgram-managed OpenAI models.
+3. No webhook or registration needed; the status callbacks Twilio already sends are all the Worker uses to track the call.
+
+### Bring your own (or local) LLM — the "api + base URL" option
+
+Deepgram's `agent.think.endpoint` lets any OpenAI-compatible chat-completions URL be the agent's brain. That includes **your local model**:
+
+```sh
+# 1. run a tool-capable model locally, e.g. Ollama
+ollama pull qwen2.5:7b
+# 2. expose it with a free tunnel (no account needed)
+cloudflared tunnel --url http://localhost:11434
+# 3. store as Worker secrets
+npx wrangler secret put DEEPGRAM_THINK_ENDPOINT_URL   # https://<tunnel>.trycloudflare.com/v1/chat/completions
+npx wrangler secret put DEEPGRAM_THINK_MODEL          # qwen2.5:7b
+npx wrangler secret put DEEPGRAM_THINK_API_KEY        # anything; your endpoint decides whether it checks it
+```
+
+Cloud options that cost $0: [Groq's free tier](https://console.groq.com) (`openai/gpt-oss-20b`, Llama 3.3 70B — fast, good tool calling), OpenRouter's free models. Because the endpoint just forwards chat-completions traffic, both the caller-facing agent and the post-call report (when no BYO endpoint is set, `OPENAI_API_KEY` is used as fallback) can run for $0.
+
+Notes:
+
+- The tunnel must be running whenever a call is placed — Deepgram's servers call the endpoint, not your machine directly. A phone call hitting a dead tunnel returns `FAILED_TO_THINK` and the agent goes silent for that turn.
+- The URL is publicly reachable while the tunnel is up. Use a random tunnel hostname (they are), or put the endpoint behind auth and pass it as a header — then a stranger would need your key anyway.
+- The model must handle tool/function calls (Qwen2.5, Llama 3.x/3.3, GPT-OSS, Mistral-class models all do). Small models below ~7B fumble the `request_input` → `check_messages` dance on noisy phone audio.
+- The audio pipeline (listen/speak) always runs on Deepgram; only the "thinking" is yours. If you want audio to never leave your hardware, that's a separate self-hosted media server project, out of scope here.
 
 ## CLI
 
@@ -111,10 +142,10 @@ Caveats:
 
 - `--for` sets who the call is for.
 - `--as` sets the caller's name (default Sam).
-- `--voice` sets the voice for the provider in use (default `eve` for xai, `marin` for openai).
+- `--voice` sets the voice for the provider in use (default `eve` for xai, `marin` for openai, `flux-kit-en` for deepgram).
 - `--max-minutes` caps the call length (default 10).
 - `--answer-timeout` sets how many seconds the caller waits for an answer (default 60).
-- `--provider` picks `xai` (default) or `openai`.
+- `--provider` picks `xai` (default), `openai` or `deepgram`.
 
 ## Writing a brief
 
@@ -137,10 +168,10 @@ Anything outside the brief turns into a question for you. The caller never makes
 
 ## How it works
 
-- Twilio dials the number. When someone answers, TwiML `<Dial><Sip>` connects the call to the provider's SIP endpoint. For xAI, an `X-Job-Id` SIP URI parameter tells the Worker which job the call belongs to; for OpenAI, the project-scoped SIP URI carries no job token, so the webhook matches the newest unaccepted live job.
-- A Durable Object per call joins the call over the provider's realtime WebSocket (Grok Voice for xAI, GPT Realtime for OpenAI). It gives the voice agent a prompt (`src/prompt.ts`) and four tools: `send_dtmf`, `request_input`, `check_messages` and `end_call`. OpenAI calls must first be accepted with `POST /v1/realtime/calls/{call_id}/accept` (the Worker does this before attaching).
+- Twilio dials the number. On SIP-bridge providers (xai, openai), TwiML `<Dial><Sip>` connects the call to the provider's SIP endpoint. For xAI, an `X-Job-Id` SIP URI parameter tells the Worker which job the call belongs to; for OpenAI, the project-scoped SIP URI carries no job token, so the webhook matches the newest unaccepted live job. On deepgram, TwiML `<Connect><Stream>` opens a bidirectional mulaw/8kHz WebSocket from Twilio to the Worker, which relays the audio to Deepgram's Voice Agent API and back — no SIP, and the caller's transcript arrives as `ConversationText` messages.
+- A Durable Object per call joins the call over the provider's realtime WebSocket (Grok Voice for xAI, GPT Realtime for OpenAI) or the media-stream bridge (deepgram). It gives the voice agent a prompt (`src/prompt.ts`) and four tools: `send_dtmf`, `request_input`, `check_messages` and `end_call`. OpenAI calls must first be accepted with `POST /v1/realtime/calls/{call_id}/accept` (the Worker does this before attaching). For deepgram, the agent emits `FunctionCallRequest`s and waits — a `check_messages` call with no answer yet is held open until your reply (or the answer timeout).
 - Questions go to whoever is watching. Answers reach the voice agent as a `check_messages` tool result, which it relays straight away.
-- When Twilio reports that the call has ended, the configured summary model (Grok 4.7 for xAI, `gpt-5-mini` for OpenAI) writes the report from the transcript.
+- When Twilio reports that the call has ended, the configured summary model (Grok 4.7 for xAI, `gpt-5-mini` for OpenAI, or the BYO/OpenAI endpoint for deepgram) writes the report from the transcript.
 - Simulated calls dial a second xAI SIP number, where another Grok session plays the other side. That number comes from the fictional 555-0100 to 555-0199 range, so it can't be a real line. Simulated calls need the xai provider.
 
 ## Configuration
@@ -155,16 +186,19 @@ Anything outside the brief turns into a question for you. The caller never makes
 | `PRINCIPAL_NAME` | Who calls are made for, by default |
 | `PHONECALL_TOKEN` | The bearer token for the API, CLI and MCP |
 | `SIP_USERNAME`, `SIP_PASSWORD`, `XAI_WEBHOOK_SECRET`, `SIM_NUMBER` | Created by setup for the xAI SIP connection (xai provider) |
-| `VOICE_PROVIDER` | `xai` (default) or `openai` |
+| `VOICE_PROVIDER` | `xai` (default), `openai` or `deepgram` |
 | `OPENAI_API_KEY`, `OPENAI_PROJECT_ID`, `OPENAI_WEBHOOK_SECRET` | Your OpenAI key, project ID (`proj_…`) and webhook signing secret (openai provider) |
+| `DEEPGRAM_API_KEY` | Your Deepgram key (deepgram provider; new accounts get $200 free, no card) |
+| `DEEPGRAM_THINK_ENDPOINT_URL`, `DEEPGRAM_THINK_API_KEY`, `DEEPGRAM_THINK_MODEL` | Optional: bring your own OpenAI-compatible LLM as the brain (see "Bring your own/local LLM" below) |
+| `DEEPGRAM_STT_MODEL`, `DEEPGRAM_TTS_MODEL`, `DEEPGRAM_SUMMARY_MODEL`, `DEEPGRAM_THINK_TEMPERATURE` | Optional defaults (`flux-general-en`, `flux-kit-en`) |
 
-You can also set `AGENT_NAME`, `VOICE`, `SUMMARY_MODEL` and `OPENAI_REALTIME_MODEL` (default `gpt-realtime-2.1`) with `npx wrangler secret put` to change the defaults (`Sam`, provider-specific default voice, `grok-4.7`/`gpt-5-mini`).
+You can also set `AGENT_NAME`, `VOICE`, `SUMMARY_MODEL`, `OPENAI_REALTIME_MODEL` (default `gpt-realtime-2.1`) and `DEEPGRAM_TTS_MODEL` with `npx wrangler secret put` to change the defaults (`Sam`, provider-specific default voice, `grok-4.7`/`gpt-5-mini`).
 
 Running `npm run setup` again replaces the xAI registration and SIP credentials. It makes a new API token unless `PHONECALL_TOKEN` is set in your environment. Run `npm run setup -- --no-sim` to skip the simulator number.
 
 ## Good to know
 
-- A call costs about $0.10 a minute: Grok Voice is $0.08, and Twilio outbound plus SIP is about $0.02 in the US.
+- A call costs about $0.10 a minute on xAI (Grok Voice $0.08 + Twilio ~$0.02). OpenAI Realtime is ~$0.2+/min depending on model and turn size. Deepgram is the cheapest: Flux STT+TTS on your $200 free credit plus whatever LLM you use for "thinking" (free on Groq).
 - The caller never claims to be human. If someone asks, it says it's an AI assistant.
 - Rules on AI calls vary by place. For example, the FCC treats AI voices as artificial voices under the TCPA. Check the rules that apply to you before calling people.
 - Setup leaves your Twilio number's incoming-call settings alone. Calls back to that number go wherever they went before.

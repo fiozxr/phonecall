@@ -22,6 +22,12 @@ export default {
       return new Response(null, { status: 204 });
     }
 
+    // Twilio Media Streams open the WebSocket here for the deepgram provider. No bearer token:
+    // the stream URL carries the unguessable job id and Twilio can't send headers it doesn't know.
+    if (root === "twilio" && a === "media" && b && req.method === "GET") {
+      return job(env, b).fetch(req);
+    }
+
     if ((root === "xai" || root === "openai") && a === "webhook" && req.method === "POST") {
       const provider = root as VoiceProviderName;
       const body = await req.text();

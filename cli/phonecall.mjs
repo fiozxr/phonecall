@@ -23,7 +23,7 @@ call options
   --max-minutes <n>        hard limit on call length (default 10)
   --answer-timeout <sec>   how long the caller waits for a reply to a question (default 60)
   --simulate <persona>     test call: a second AI plays the person you're calling; nobody is dialed (xai only)
-  --provider <name>        which voice provider runs the call: xai (default) or openai
+  --provider <name>        which voice provider runs the call: xai (default), openai or deepgram
   --watch                  start watching right away
 
 watch prints live progress to stderr and exits with one JSON line on stdout:

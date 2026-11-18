@@ -1,21 +1,20 @@
 import { callerInstructions, callerTools } from "./prompt";
 import type { Env, Job } from "./types";
 
-// Every voice provider plugs in here. The realtime wire protocol is shared
-// (it is the OpenAI Realtime protocol; xAI implements a compatible version of it),
-// so per call the only provider-specific parts are:
-//   - the SIP URI Twilio bridges into once the callee answers
-//   - whether the provider requires an explicit "accept" before attaching
-//   - API endpoints, keys and default models/voices
-export type VoiceProviderName = "xai" | "openai";
+// Voice providers plug in here. Two families:
+//   - SIP bridge (xai, openai): Twilio <Dial><Sip> connects the call provider-side; the
+//     Worker only manages the realtime sideband WebSocket and the job lifecycle.
+//   - Media stream (deepgram): Twilio <Connect><Stream> opens a WebSocket to *this* Worker,
+//     which relays mulaw/8kHz audio to Deepgram's Voice Agent (STT+LLM+TTS) and back.
+export type VoiceProviderName = "xai" | "openai" | "deepgram";
 
 export function isVoiceProvider(v: unknown): v is VoiceProviderName {
-  return v === "xai" || v === "openai";
+  return v === "xai" || v === "openai" || v === "deepgram";
 }
 
 export function providerDefault(env: Env): VoiceProviderName {
   const p = (env.VOICE_PROVIDER ?? "").trim().toLowerCase();
-  return p === "openai" ? "openai" : "xai";
+  return p === "openai" ? "openai" : p === "deepgram" ? "deepgram" : "xai";
 }
 
 // `provider` is optional on stored jobs so calls written before multi-provider support keep working.
@@ -23,15 +22,25 @@ export function providerOf(job: Job | null | undefined, env: Env): VoiceProvider
   return job?.provider ?? providerDefault(env);
 }
 
+export function isMediaStreamProvider(name: VoiceProviderName): boolean {
+  return name === "deepgram";
+}
+
 export function defaultVoice(name: VoiceProviderName): string {
-  return name === "openai" ? "marin" : "eve";
+  if (name === "openai") return "marin";
+  if (name === "deepgram") return "flux-kit-en";
+  return "eve";
 }
 
 export function apiKey(env: Env, name: VoiceProviderName): string {
-  return name === "openai" ? env.OPENAI_API_KEY ?? "" : env.XAI_API_KEY;
+  switch (name) {
+    case "openai": return env.OPENAI_API_KEY ?? "";
+    case "deepgram": return env.DEEPGRAM_API_KEY ?? "";
+    default: return env.XAI_API_KEY;
+  }
 }
 
-// The SIP URI Twilio bridges the call into once the callee answers.
+// The SIP URI Twilio bridges the call into once the callee answers (SIP-bridge providers only).
 // xAI exposes the job id as a SIP URI parameter, which it echoes back in the webhook's sip_headers;
 // OpenAI's URI is fixed per project, so jobs are correlated from the webhook instead (see unattached()).
 export function sipUri(env: Env, job: Job): string {
@@ -51,7 +60,7 @@ export function realtimeCallUrl(name: VoiceProviderName, callId: string, action:
 }
 
 // OpenAI requires the inbound SIP call to be accepted (with the session config)
-// before its sideband WebSocket can attach. xAI accepts implicitly.
+// before its sideband WebSocket can attach. xAI accepts implicitly; Deepgram has no SIP accept step.
 export async function acceptCall(env: Env, job: Job, callId: string): Promise<{ ok: true } | { error: string }> {
   const name = providerOf(job, env);
   if (name !== "openai") return { ok: true };
@@ -72,12 +81,62 @@ export async function acceptCall(env: Env, job: Job, callId: string): Promise<{ 
   return { error: `OpenAI accept failed (${res.status}): ${text}` };
 }
 
+// ---- Deepgram Voice Agent (media-stream provider) ----
+
+// Settings for the Voice Agent pipeline: Flux STT (turn-taking built in) + your choice of LLM
+// ("think") + Flux TTS. The think step can point at ANY OpenAI-compatible chat completions URL,
+// including a local model exposed through a tunnel — that is what "bring your own base URL" means.
+export function deepgramSettings(env: Env, job: Job): Record<string, unknown> {
+  const endpoint = (env.DEEPGRAM_THINK_ENDPOINT_URL ?? "").trim();
+  const model = (env.DEEPGRAM_THINK_MODEL ?? "").trim() || (endpoint ? "" : "gpt-4o-mini");
+  if (endpoint && !model) throw new Error("DEEPGRAM_THINK_ENDPOINT_URL is set but DEEPGRAM_THINK_MODEL is empty (any model name your endpoint understands, e.g. qwen2.5:7b)");
+  const think: Record<string, unknown> = {
+    provider: { type: "open_ai", model, ...(env.DEEPGRAM_THINK_TEMPERATURE ? { temperature: Number(env.DEEPGRAM_THINK_TEMPERATURE) } : {}) },
+    prompt: callerInstructions(job),
+    // defer_until_eot: hanging up must wait until the caller's turn is confirmed — a premature
+    // end_call can't be un-hung-up.
+    functions: callerTools(job.principal).map((f) => f.name === "end_call" ? { ...f, defer_until_eot: true } : f),
+  };
+  if (endpoint) think.endpoint = { url: endpoint, headers: { authorization: `Bearer ${env.DEEPGRAM_THINK_API_KEY ?? ""}` } };
+  return {
+    type: "Settings",
+    mip_opt_out: true,
+    audio: {
+      // Phone audio: mulaw 8kHz both ways, no transcoding anywhere.
+      input: { encoding: "mulaw", sample_rate: 8000 },
+      output: { encoding: "mulaw", sample_rate: 8000, container: "none" },
+    },
+    agent: {
+      listen: { provider: { type: "deepgram", model: env.DEEPGRAM_STT_MODEL || "flux-general-en", version: "v2" } },
+      think,
+      speak: { provider: { type: "deepgram", version: "v2", model: job.voice || env.DEEPGRAM_TTS_MODEL || "flux-kit-en" } },
+    },
+  };
+}
+
 export function chatCompletionsUrl(name: VoiceProviderName): string {
   return name === "openai" ? "https://api.openai.com/v1/chat/completions" : "https://api.x.ai/v1/chat/completions";
 }
 
 export function defaultSummaryModel(env: Env, name: VoiceProviderName): string {
   return env.SUMMARY_MODEL || (name === "openai" ? "gpt-5-mini" : "grok-4.7");
+}
+
+// Deepgram manages no chat-completions endpoint of its own, so the post-call summary reuses the
+// BYO think endpoint when one is configured, then falls back to OpenAI if a key is present.
+// Neither available → null, and the report ships as transcript + a note instead of an LLM summary.
+export function summaryConfig(env: Env, job: Job): { url: string; auth: string; model: string } | null {
+  if (providerOf(job, env) !== "deepgram") {
+    const name = providerOf(job, env);
+    return { url: chatCompletionsUrl(name), auth: `Bearer ${apiKey(env, name)}`, model: defaultSummaryModel(env, name) };
+  }
+  if (env.DEEPGRAM_THINK_ENDPOINT_URL) {
+    return { url: env.DEEPGRAM_THINK_ENDPOINT_URL, auth: `Bearer ${env.DEEPGRAM_THINK_API_KEY ?? ""}`, model: env.DEEPGRAM_SUMMARY_MODEL || env.DEEPGRAM_THINK_MODEL || "" };
+  }
+  if (env.OPENAI_API_KEY) {
+    return { url: chatCompletionsUrl("openai"), auth: `Bearer ${env.OPENAI_API_KEY}`, model: env.SUMMARY_MODEL || "gpt-5-mini" };
+  }
+  return null;
 }
 
 // Which secret a /<provider>/webhook endpoint verifies against.

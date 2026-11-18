@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 // One-time setup: stores the Worker's secrets with wrangler and writes the CLI config to ~/.config/phonecall.
-// Works for both voice providers:
-//   xai    (default) registers the Twilio number with xAI's SIP service; simulated test calls work
-//   openai            no registration is needed; you create the OpenAI webhook by hand (the script tells you how)
+// Works for all voice providers:
+//   xai      (default) registers the Twilio number with xAI's SIP service; simulated test calls work
+//   openai             no registration needed; you create the OpenAI webhook by hand (the script tells you how)
+//   deepgram           no registration needed; STT/TTS run on Deepgram, and you can plug your own
+//                      OpenAI-compatible LLM (including a local model via a tunnel) as the brain
 // Values can come from environment variables of the same name; anything missing is asked for.
 import { spawnSync } from "node:child_process";
 import { randomBytes, randomInt } from "node:crypto";
@@ -28,9 +30,9 @@ function fail(message) {
   process.exit(1);
 }
 
-const provider = (process.env.VOICE_PROVIDER?.trim().toLowerCase() || (await rl.question("Voice provider, xai or openai [xai]: ")).trim().toLowerCase() || "xai");
-if (provider !== "xai" && provider !== "openai") fail("provider must be xai or openai");
-if (provider === "openai" && simulate && !process.argv.includes("--no-sim")) {
+const provider = (process.env.VOICE_PROVIDER?.trim().toLowerCase() || (await rl.question("Voice provider, xai, openai or deepgram [xai]: ")).trim().toLowerCase() || "xai");
+if (provider !== "xai" && provider !== "openai" && provider !== "deepgram") fail("provider must be xai, openai or deepgram");
+if (provider !== "xai" && simulate && !process.argv.includes("--no-sim")) {
   console.error("Note: --simulate is only supported by the xai provider; simulation will not be set up.");
 }
 
@@ -73,6 +75,22 @@ OpenAI needs one webhook, created by hand:
   4. Copy the webhook's signing secret (starts with whsec_)
 `);
   secrets.OPENAI_WEBHOOK_SECRET = await value("OPENAI_WEBHOOK_SECRET", "OpenAI webhook signing secret (whsec_…)", (v) => v.length > 0);
+  rl.close();
+} else if (provider === "deepgram") {
+  const deepgramKey = await value("DEEPGRAM_API_KEY", "Deepgram API key (free, no card: console.deepgram.com)");
+  secrets.DEEPGRAM_API_KEY = deepgramKey;
+  console.error(`
+Deepgram does the ears and voice (Flux STT + Flux TTS, ~$200 of free credit).
+The brain is an LLM of your choice — leave empty to use Deepgram's managed OpenAI models:`);
+  const endpoint = process.env.DEEPGRAM_THINK_ENDPOINT_URL?.trim() ?? (await rl.question("LLM base URL, any OpenAI-compatible /v1/chat/completions (e.g. https://api.groq.com/openai/v1/chat/completions, or a tunnel to a local model — empty = Deepgram-managed OpenAI): ")).trim();
+  if (endpoint) {
+    secrets.DEEPGRAM_THINK_ENDPOINT_URL = endpoint;
+    secrets.DEEPGRAM_THINK_MODEL = await value("DEEPGRAM_THINK_MODEL", "Model name your endpoint expects (e.g. qwen2.5:7b, openai/gpt-oss-20b)");
+    secrets.DEEPGRAM_THINK_API_KEY = process.env.DEEPGRAM_THINK_API_KEY?.trim() ?? (await rl.question("API key for that endpoint (empty if it needs none): ")).trim();
+    console.error("Local model tip: run Ollama + `cloudflared tunnel --url http://localhost:11434` and use https://<tunnel>/v1/chat/completions with a tool-capable model.");
+  }
+  const tts = process.env.DEEPGRAM_TTS_MODEL?.trim();
+  if (tts) secrets.DEEPGRAM_TTS_MODEL = tts;
   rl.close();
 } else {
   const xaiKey = await value("XAI_API_KEY", "xAI API key");
@@ -157,8 +175,18 @@ MCP token:  ~/.config/phonecall/token
 ${provider === "xai" ? `
 Try a simulated call (nobody is dialed):
   phonecall call --simulate "You run the counter at a busy pizza place." \\
-    --brief "Order a large pepperoni for pickup at 7pm." --watch` : `
+    --brief "Order a large pepperoni for pickup at 7pm." --watch` : provider === "openai" ? `
 Try a test call:
   phonecall call +1XXXXXXXXXX --watch \\
-    --brief "Book a table for 2 at 7pm tonight."`}
+    --brief "Book a table for 2 at 7pm tonight."` : `
+Try a test call:
+  phonecall call +1XXXXXXXXXX --watch \\
+    --brief "Book a table for 2 at 7pm tonight."
+
+Deepgram is doing the listening and the talking. The brain:
+  - managed OpenAI (default): nothing else to set
+  - your own endpoint: set DEEPGRAM_THINK_ENDPOINT_URL / DEEPGRAM_THINK_MODEL / DEEPGRAM_THINK_API_KEY
+    (e.g. Groq's free tier, OpenRouter, or a tunnel to your local Ollama — see README)
+  - summaries after the call: reuses the think endpoint, or OPENAI_API_KEY as fallback;
+    set DEEPGRAM_SUMMARY_MODEL to override`}
 `);

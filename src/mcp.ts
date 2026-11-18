@@ -23,7 +23,7 @@ const TOOLS = [
         max_minutes: { type: "number", description: "Hard limit on call length, 1-30 (default 10)." },
         answer_timeout: { type: "number", description: "Seconds the caller waits for your reply to a question (default 60)." },
         simulate: { type: "string", description: "Test only: persona for a second AI that plays the person being called. Nobody is dialed. xai provider only." },
-        provider: { type: "string", enum: ["xai", "openai"], description: "Which voice provider runs the call (default: the server's VOICE_PROVIDER, or xai)." },
+        provider: { type: "string", enum: ["xai", "openai", "deepgram"], description: "Which voice provider runs the call (default: the server's VOICE_PROVIDER, or xai)." },
       },
       required: ["brief"],
     },

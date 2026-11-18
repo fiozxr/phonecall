@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { callerInstructions, callerTools, simulatedCalleeInstructions, summaryPrompt } from "./prompt";
-import { apiKey, acceptCall, chatCompletionsUrl, defaultSummaryModel, defaultVoice, providerDefault, providerOf, realtimeCallUrl, realtimeWsUrl, sipUri, type VoiceProviderName } from "./providers";
+import { apiKey, acceptCall, summaryConfig, deepgramSettings, isMediaStreamProvider, providerDefault, providerOf, realtimeCallUrl, realtimeWsUrl, sipUri, defaultVoice, type VoiceProviderName } from "./providers";
 import type { Env, Job, JobEvent, JobStatus, Question, Report } from "./types";
 
 const TERMINAL = new Set(["completed", "busy", "no-answer", "failed", "canceled"]);
@@ -26,12 +26,26 @@ type Answer = { question: string; answer: string | null; note?: string };
 const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, Math.round(n)));
 const xml = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 const send = (ws: WebSocket | null, msg: unknown) => ws?.send(JSON.stringify(msg));
+const b64encode = (bytes: Uint8Array) => {
+  let s = "";
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s);
+};
+const b64decode = (s: string) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
 
 // One phone call: dials through Twilio, runs the Grok voice session, collects questions and the transcript.
 export class CallJob extends DurableObject<Env> {
   job: Job | null = null;
   agent: WebSocket | null = null;
   sim: WebSocket | null = null;
+  // Media-stream pipeline (deepgram provider): Twilio <-> this DO <-> Deepgram Voice Agent.
+  twilioWs: WebSocket | null = null;
+  streamSid: string | null = null;
+  deepgram: WebSocket | null = null;
+  settingsApplied = false;
+  prebuffer: Uint8Array[] = [];
+  // A check_messages call whose response is held until the principal answers an open question.
+  pendingCheck: { id: string; name: string } | null = null;
   responseActive = false;
   userSpeaking = false;
   responseStartedAt = 0;
@@ -100,13 +114,15 @@ export class CallJob extends DurableObject<Env> {
     if (this.job) return { error: "job already exists" };
     const env = this.env;
     const provider = input.provider ?? providerDefault(env);
+    // env.VOICE is xai/openai-specific; deepgram's voice is the Flux TTS model id.
+    const fallbackVoice = provider === "deepgram" ? env.DEEPGRAM_TTS_MODEL || "flux-kit-en" : env.VOICE || defaultVoice(provider);
     this.job = {
       id: input.id,
       to: input.to,
       brief: input.brief,
       principal: input.principal || env.PRINCIPAL_NAME || "",
       agentName: input.agentName || env.AGENT_NAME || "Sam",
-      voice: input.voice || env.VOICE || defaultVoice(provider),
+      voice: input.voice || fallbackVoice,
       provider,
       maxMinutes: clamp(input.maxMinutes ?? 10, 1, 30),
       answerTimeoutSec: clamp(input.answerTimeoutSec ?? 60, 10, 300),
@@ -121,17 +137,25 @@ export class CallJob extends DurableObject<Env> {
     // Backstop in case Twilio's final status callback never arrives.
     await this.ctx.storage.setAlarm(Date.now() + (this.job.maxMinutes + 5) * 60_000);
 
-    // When the callee answers, Twilio bridges them to the provider's SIP endpoint; the xai URI
-    // carries an X-Job-Id parameter that comes back in the webhook's sip_headers.
-    const agentUri = sipUri(env, this.job);
-    // OpenAI routes by the project id in the URI and needs no digest auth; xAI expects the SIP credentials.
-    const sipElement = provider === "openai"
-      ? `<Sip>${xml(agentUri)}</Sip>`
-      : `<Sip username="${xml(env.SIP_USERNAME)}" password="${xml(env.SIP_PASSWORD)}">${xml(agentUri)}</Sip>`;
+    // Twilio connects the callee to the provider once they answer.
+    // SIP bridges (xai, openai) use <Dial><Sip>; the xai URI carries an X-Job-Id parameter that
+    // comes back in the webhook's sip_headers. Deepgram uses a bidirectional <Connect><Stream>
+    // WebSocket straight to this Worker, which relays audio to the Voice Agent API.
+    let twiml: string;
+    if (provider === "deepgram") {
+      twiml = `<Response><Connect><Stream url="${xml(`${this.job.origin}/twilio/media/${this.job.id}`)}"/></Connect></Response>`;
+    } else {
+      const agentUri = sipUri(env, this.job);
+      // OpenAI routes by the project id in the URI and needs no digest auth; xAI expects the SIP credentials.
+      const sipElement = provider === "openai"
+        ? `<Sip>${xml(agentUri)}</Sip>`
+        : `<Sip username="${xml(env.SIP_USERNAME)}" password="${xml(env.SIP_PASSWORD)}">${xml(agentUri)}</Sip>`;
+      twiml = `<Response><Dial>${sipElement}</Dial></Response>`;
+    }
     const params = new URLSearchParams({
       From: env.TWILIO_PHONE_NUMBER,
       To: this.job.simulate ? `sip:${env.SIM_NUMBER}@sip.voice.x.ai;transport=tls?X-Sim-Job=${this.job.id}` : this.job.to,
-      Twiml: `<Response><Dial>${sipElement}</Dial></Response>`,
+      Twiml: twiml,
       StatusCallback: `${this.job.origin}/twilio/status/${this.job.id}`,
       StatusCallbackMethod: "POST",
       Timeout: "30",
@@ -185,7 +209,186 @@ export class CallJob extends DurableObject<Env> {
     return { ok: true };
   }
 
+  // Twilio <Connect><Stream> opens a bidirectional WebSocket to /twilio/media/<job-id>.
+  // This Worker is the media relay for the deepgram provider: mulaw/8kHz both ways, no transcoding.
+  async fetch(request: Request): Promise<Response> {
+    if (!this.job || providerOf(this.job, this.env) !== "deepgram") return new Response("unknown job", { status: 404 });
+    if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") return new Response("expected websocket upgrade", { status: 426 });
+    const env = this.env;
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    this.twilioWs = server as unknown as WebSocket;
+    server.accept();
+    server.addEventListener("message", (m: { data: string | ArrayBuffer }) => this.onTwilioEvent(m));
+    server.addEventListener("close", () => {
+      this.twilioWs = null;
+      this.streamSid = null;
+    });
+
+    const res = await fetch("wss://agent.deepgram.com/v1/agent/converse", {
+      headers: { Upgrade: "websocket", Authorization: `Token ${env.DEEPGRAM_API_KEY}` },
+    });
+    const dg = res.webSocket;
+    if (!dg) {
+      const detail = (await res.text()).slice(0, 200);
+      this.emit("error", { message: `deepgram connect failed: ${res.status} ${detail}` });
+      server.close(1011, "deepgram connect failed");
+      return new Response("deepgram connect failed", { status: 502 });
+    }
+    this.deepgram = dg;
+    dg.accept();
+    dg.addEventListener("message", (m: { data: string | ArrayBuffer }) => this.onDeepgramEvent(m));
+    dg.addEventListener("close", (e: { code: number }) => {
+      this.deepgram = null;
+      this.settingsApplied = false;
+      this.emit("status", { status: "voice_session_closed", code: e.code });
+    });
+    await this.registry().update(this.job.id, { attached: true });
+    this.emit("debug", { media: "twilio<->deepgram" });
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  private toTwilio(msg: Record<string, unknown>) {
+    send(this.twilioWs, msg);
+  }
+
+  private onTwilioEvent(m: { data: string | ArrayBuffer }) {
+    if (typeof m.data !== "string") return;
+    let msg: any;
+    try {
+      msg = JSON.parse(m.data);
+    } catch {
+      return;
+    }
+    switch (msg.event) {
+      case "connected":
+        break;
+      case "start":
+        this.streamSid = msg.start?.streamSid ?? msg.streamSid ?? null;
+        this.emit("debug", { media_stream_sid: this.streamSid });
+        break;
+      case "media": {
+        const payload = msg.media?.payload;
+        if (typeof payload !== "string") break;
+        const bytes = b64decode(payload);
+        if (this.deepgram && this.settingsApplied) this.deepgram.send(bytes.buffer as ArrayBuffer);
+        else if (this.prebuffer.length < 200) this.prebuffer.push(bytes);
+        break;
+      }
+      case "dtmf":
+        this.emit("dtmf", { digit: msg.dtmf?.digit });
+        break;
+      case "mark":
+        break;
+      case "stop":
+        try {
+          this.deepgram?.close(1000, "call ended");
+        } catch {}
+        this.deepgram = null;
+        break;
+    }
+  }
+
+  private onDeepgramEvent(m: { data: string | ArrayBuffer }) {
+    // Binary frames are the agent's voice (mulaw/8kHz): pipe them to the caller unchanged.
+    if (m.data instanceof ArrayBuffer) {
+      if (this.twilioWs && this.streamSid) this.toTwilio({ event: "media", streamSid: this.streamSid, media: { payload: b64encode(new Uint8Array(m.data)) } });
+      return;
+    }
+    let e: any;
+    try {
+      e = JSON.parse(String(m.data));
+    } catch {
+      return;
+    }
+    switch (e.type) {
+      case "Welcome": {
+        try {
+          send(this.deepgram!, deepgramSettings(this.env, this.job!));
+        } catch (err) {
+          this.emit("error", { message: `deepgram configuration invalid: ${String(err).slice(0, 200)}` });
+          try {
+            this.twilioWs?.close(1011, "bad settings");
+          } catch {}
+          try {
+            this.deepgram?.close(1000, "bad settings");
+          } catch {}
+        }
+        break;
+      }
+      case "SettingsApplied":
+        this.settingsApplied = true;
+        for (const bytes of this.prebuffer) this.deepgram?.send(bytes.buffer as ArrayBuffer);
+        this.prebuffer = [];
+        break;
+      case "Settings":
+      case "SettingsError":
+      case "UnhandledClientMessage":
+        if (e.type === "SettingsError") {
+          this.emit("error", { message: `deepgram rejected Settings: ${JSON.stringify(e).slice(0, 300)}` });
+          try {
+            this.twilioWs?.close(1011, "settings failed");
+          } catch {}
+        } else this.emit("debug", { deepgram_event: e.type, detail: e.description ?? String(e).slice(0, 200) });
+        break;
+      case "ConversationText": {
+        const text = typeof e.content === "string" ? e.content.trim() : "";
+        if (!text) break;
+        if (e.role === "user") this.emit("said", { who: "them", text });
+        else if (e.role === "assistant") {
+          this.emit("said", { who: "agent", text });
+          this.audioEndsAt = Math.max(this.audioEndsAt, Date.now() + text.length * MS_PER_CHAR);
+        }
+        break;
+      }
+      case "UserStartedSpeaking":
+        this.userSpeaking = true;
+        // Barge-in: stop any buffered agent audio on the call right away.
+        if (this.twilioWs && this.streamSid) this.toTwilio({ event: "clear", streamSid: this.streamSid });
+        break;
+      case "AgentThinking":
+      case "ConversationTextDone":
+        break;
+      case "AgentAudioDone":
+        this.userSpeaking = false;
+        this.audioEndsAt = Date.now();
+        if (this.hangupPending) this.scheduleHangup();
+        break;
+      case "FunctionCallRequest":
+        for (const fc of e.functions ?? []) {
+          if (fc.client_side === false) {
+            this.emit("debug", { server_side_function: fc.name });
+            continue;
+          }
+          this.onTool(fc.name, fc.id, typeof fc.arguments === "string" ? fc.arguments : JSON.stringify(fc.arguments ?? {}));
+        }
+        break;
+      case "FunctionCallCancelled":
+        for (const fc of e.functions ?? []) {
+          if (this.pendingCheck?.id === fc.id) this.pendingCheck = null;
+        }
+        break;
+      case "Error":
+        this.emit("error", { message: e.description ?? e.message ?? JSON.stringify(e).slice(0, 300) });
+        break;
+      case "Warning":
+        this.emit("debug", { deepgram_warning: e.description ?? String(e).slice(0, 200) });
+        break;
+      default:
+        if (!this.seenTypes.has(e.type)) {
+          this.seenTypes.add(e.type);
+          this.emit("debug", { deepgram_event: e.type });
+        }
+    }
+  }
+
+  // Deepgram function responses: the agent continues the turn once it receives this message.
+  private deepgramOutput(fc: { id: string; name: string }, result: unknown) {
+    send(this.deepgram, { type: "FunctionCallResponse", id: fc.id, name: fc.name, content: JSON.stringify(result) });
+  }
+
   async attach(callId: string, role: "agent" | "sim", sipHeaders: string[]): Promise<{ ok: true } | { error: string }> {
+    if (isMediaStreamProvider(providerOf(this.job, this.env))) return { error: "this provider uses Twilio media streams, not SIP attach" };
     if (!this.job || this.job.status === "done" || this.job.status === "ended") return { error: "no live job" };
     if (role === "agent" ? this.agent : this.sim) return { error: "already attached" };
     this.emit("debug", { sip_leg: role, sip_headers: sipHeaders });
@@ -380,40 +583,53 @@ export class CallJob extends DurableObject<Env> {
 
   private onTool(name: string, callId: string, argsJson: string) {
     const job = this.job!;
+    const provider = providerOf(job, this.env);
+    const isMedia = isMediaStreamProvider(provider);
+    // SIP providers need a function_call_output (+ sometimes response.create); deepgram takes one
+    // FunctionCallResponse per request id and continues the turn by itself.
+    const out = (result: unknown, respond: boolean) =>
+      isMedia ? this.deepgramOutput({ id: callId, name }, result) : this.output(callId, result, respond);
     let args: Record<string, string> = {};
     try {
       args = JSON.parse(argsJson || "{}");
     } catch {}
     switch (name) {
       case "send_dtmf":
-        // xAI sends the tones itself and expects no reply.
+        // xAI sends the tones itself; deepgram has no way to inject tones mid-stream.
         this.emit("dtmf", args);
+        if (isMedia) out({ note: "DTMF isn't supported on the deepgram provider. Say you can't press the keys and ask for a person instead." }, false);
         return;
       case "request_input": {
         const id = `q${this.questions().length + 1}`;
         this.ctx.storage.sql.exec(`INSERT INTO questions (id, question, status, asked_at) VALUES (?, ?, 'pending', ?)`, id, args.question ?? "", Date.now());
         this.emit("input_request", { id, question: args.question });
-        this.output(callId, { status: "sent", note: `${job.principal} has your question. Don't say anything else about it unless they talk to you.` }, false);
+        out({ status: "sent", note: `${job.principal} has your question. Don't say anything else about it unless they talk to you.` }, false);
         setTimeout(() => this.expireQuestion(id), job.answerTimeoutSec * 1000);
+        // The agent is expected to call check_messages right after this response.
         return;
       }
       case "check_messages": {
         const answers = this.queue.splice(0);
         // With nothing to report, stay quiet instead of prompting a turn ("Still nothing...").
-        if (answers.length) this.output(callId, { answers }, true);
-        else this.output(callId, { answers: [], note: `${job.principal} is still checking. Don't comment on it; carry on only if they talk to you.` }, false);
+        if (answers.length) out({ answers }, true);
+        else if (isMedia) this.pendingCheck = { id: callId, name }; // hold the call open; reply()/expireQuestion() answer it
+        else out({ answers: [], note: `${job.principal} is still checking. Don't comment on it; carry on only if they talk to you.` }, false);
         return;
       }
       case "end_call":
         job.endCall = { outcome: args.outcome ?? "done", notes: args.notes };
         this.ctx.waitUntil(this.save());
         this.emit("end_call", job.endCall);
-        this.output(callId, { ok: true }, false);
+        out({ ok: true }, false);
         this.hangupPending = true;
-        if (!this.responseActive) this.scheduleHangup();
+        if (isMedia) {
+          // No responseActive tracking: wait for AgentAudioDone, with a ceiling as backstop.
+          this.audioEndsAt = Date.now() + 2500;
+          this.scheduleHangup();
+        } else if (!this.responseActive) this.scheduleHangup();
         return;
       default:
-        this.output(callId, { error: `unknown tool ${name}` }, true);
+        out({ error: `unknown tool ${name}` }, true);
     }
   }
 
@@ -430,6 +646,16 @@ export class CallJob extends DurableObject<Env> {
 
   // Deliver answers as a check_messages tool result. A plain system message gets ignored by the model.
   private flush() {
+    if (!this.job) return;
+    if (isMediaStreamProvider(providerOf(this.job, this.env))) {
+      // Deepgram can't be given a synthetic tool call; answer a check_messages we're holding open instead.
+      if (this.pendingCheck && this.queue.length) {
+        const answers = this.queue.splice(0);
+        this.deepgramOutput(this.pendingCheck, { answers });
+        this.pendingCheck = null;
+      }
+      return;
+    }
     if (!this.agent || this.responseActive || this.userSpeaking || this.hangupPending || !this.queue.length) return;
     const answers = this.queue.splice(0);
     const callId = `call-msg-${Date.now()}`;
@@ -455,6 +681,20 @@ export class CallJob extends DurableObject<Env> {
   private async endCall() {
     const job = this.job;
     if (!job) return;
+    if (isMediaStreamProvider(providerOf(job, this.env))) {
+      // Twilio REST hangup (below) is the signalling path; closing the bridge triggers Twilio 'stop'.
+      for (const ws of [this.deepgram, this.twilioWs]) {
+        try {
+          ws?.close(1000, "call ended");
+        } catch {}
+      }
+      this.deepgram = null;
+      this.twilioWs = null;
+      this.settingsApplied = false;
+      this.prebuffer = [];
+      this.pendingCheck = null;
+      this.streamSid = null;
+    }
     if (job.xaiCallId) {
       const provider = providerOf(job, this.env);
       const res = await fetch(realtimeCallUrl(provider, job.xaiCallId, "hangup"), {
@@ -487,12 +727,12 @@ export class CallJob extends DurableObject<Env> {
       job.endedAt = Date.now();
       this.setStatus("ended", { reason });
       if (this.openerTimer) clearTimeout(this.openerTimer);
-      for (const ws of [this.agent, this.sim]) {
+      for (const ws of [this.agent, this.sim, this.deepgram, this.twilioWs]) {
         try {
           ws?.close(1000, "call ended");
         } catch {}
       }
-      this.agent = this.sim = null;
+      this.agent = this.sim = this.deepgram = this.twilioWs = null;
       this.ctx.storage.sql.exec(`UPDATE questions SET status = 'timed_out' WHERE status = 'pending'`);
       job.report = await this.summarize(reason);
       await this.save();
@@ -518,13 +758,16 @@ export class CallJob extends DurableObject<Env> {
     const questions = this.questions()
       .map((q) => `- ${q.question} → ${q.answer ?? "(no answer)"}`)
       .join("\n");
-    const provider = providerOf(job, this.env);
+    const summary = summaryConfig(this.env, job);
+    if (!summary) {
+      return empty(job.endCall?.outcome ?? "partial", `Summary skipped (no summary LLM configured: set DEEPGRAM_THINK_ENDPOINT_URL/DEEPGRAM_THINK_MODEL or OPENAI_API_KEY). Agent note: ${job.endCall?.notes ?? "none"}`);
+    }
     try {
-      const res = await fetch(chatCompletionsUrl(provider), {
+      const res = await fetch(summary.url, {
         method: "POST",
-        headers: { Authorization: `Bearer ${apiKey(this.env, provider)}`, "Content-Type": "application/json" },
+        headers: { Authorization: summary.auth, "Content-Type": "application/json" },
         body: JSON.stringify({
-          model: defaultSummaryModel(this.env, provider),
+          model: summary.model,
           messages: [{ role: "user", content: summaryPrompt(job, lines.join("\n"), questions) }],
           response_format: { type: "json_object" },
         }),
