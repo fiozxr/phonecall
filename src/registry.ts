@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import type { Env, JobStatus } from "./types";
+import type { Env, JobStatus } from "./types.ts";
 
 export type JobRow = {
   id: string;

@@ -208,6 +208,16 @@ You can also set `AGENT_NAME`, `VOICE`, `SUMMARY_MODEL`, `OPENAI_REALTIME_MODEL`
 
 Running `npm run setup` again replaces the xAI registration and SIP credentials. It makes a new API token unless `PHONECALL_TOKEN` is set in your environment. Run `npm run setup -- --no-sim` to skip the simulator number.
 
+## Testing
+
+- `npm test` — unit tests (audio codec, provider config, webhook verification, `startJob` validation). No network or credentials needed.
+- `npx wrangler dev` runs the whole Worker locally, Durable Objects included. Put test secrets in `.dev.vars` (gitignored) and point the CLI at it:
+  ```sh
+  PHONECALL_URL=http://localhost:8787 PHONECALL_TOKEN=test-token node cli/phonecall.mjs list
+  ```
+  With fake credentials, a call starts, Twilio rejects it (HTTP 401), and the job lands in `done` with an empty-talk report — the full lifecycle runs locally.
+- The real thing needs a deployed Worker (`npx wrangler deploy`), `npm run setup`, and a Twilio number. Cheapest end-to-end test: `phonecall call <your own verified number> --provider google --watch --brief "Ask my name, then say goodbye and hang up."` — the Twilio trial covers the ~$0.02/min call to yourself; the Gemini Live API side is free of charge.
+
 ## Good to know
 
 - A call costs about $0.10 a minute on xAI (Grok Voice $0.08 + Twilio ~$0.02). OpenAI Realtime is ~$0.2+/min depending on model and turn size. Deepgram is the cheapest S2S-ish option: Flux STT+TTS on your $200 free credit plus whatever LLM you use for "thinking" (free on Groq). **Google is the only $0 one**: the Gemini Live models are free on the AI Studio tier (rate-limited; content improves Google's products). Simulated calls remain xai-only.

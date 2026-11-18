@@ -1,5 +1,5 @@
-import type { CallJob } from "./call-job";
-import type { Registry } from "./registry";
+import type { CallJob } from "./call-job.ts";
+import type { Registry } from "./registry.ts";
 
 export interface Env {
   CALL_JOB: DurableObjectNamespace<CallJob>;

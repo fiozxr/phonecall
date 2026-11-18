@@ -1,5 +1,5 @@
-import type { Env, JobEvent } from "./types";
-import { isVoiceProvider, providerDefault, type VoiceProviderName } from "./providers";
+import type { Env, JobEvent } from "./types.ts";
+import { isVoiceProvider, providerDefault, type VoiceProviderName } from "./providers.ts";
 
 const E164 = /^\+[1-9]\d{7,14}$/;
 

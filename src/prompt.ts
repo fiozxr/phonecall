@@ -1,4 +1,4 @@
-import type { Job } from "./types";
+import type { Job } from "./types.ts";
 
 // Grok Voice follows the section order from xAI's speech-to-speech prompting guide.
 export function callerInstructions(job: Job): string {

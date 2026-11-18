@@ -1,5 +1,5 @@
-import { callerInstructions, callerTools } from "./prompt";
-import type { Env, Job } from "./types";
+import { callerInstructions, callerTools } from "./prompt.ts";
+import type { Env, Job } from "./types.ts";
 
 // Voice providers plug in here. Two families:
 //   - SIP bridge (xai, openai): Twilio <Dial><Sip> connects the call provider-side; the

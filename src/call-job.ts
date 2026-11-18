@@ -1,8 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
-import { callerInstructions, callerTools, simulatedCalleeInstructions, summaryPrompt } from "./prompt";
-import { Downsampler3x1, bytesToPcm16, mulawToPcm16, pcm16ToBytes, pcm16ToMulaw } from "./audio";
-import { apiKey, acceptCall, summaryConfig, deepgramSettings, googleSettings, googleWsUrl, isMediaStreamProvider, providerDefault, providerOf, realtimeCallUrl, realtimeWsUrl, sipUri, defaultVoice, type VoiceProviderName } from "./providers";
-import type { Env, Job, JobEvent, JobStatus, Question, Report } from "./types";
+import { callerInstructions, callerTools, simulatedCalleeInstructions, summaryPrompt } from "./prompt.ts";
+import { Downsampler3x1, bytesToPcm16, mulawToPcm16, pcm16ToBytes, pcm16ToMulaw } from "./audio.ts";
+import { apiKey, acceptCall, summaryConfig, deepgramSettings, googleSettings, googleWsUrl, isMediaStreamProvider, providerDefault, providerOf, realtimeCallUrl, realtimeWsUrl, sipUri, defaultVoice, type VoiceProviderName } from "./providers.ts";
+import type { Env, Job, JobEvent, JobStatus, Question, Report } from "./types.ts";
 
 const TERMINAL = new Set(["completed", "busy", "no-answer", "failed", "canceled"]);
 // Rough speaking rate, used to wait for the goodbye to finish playing before hanging up.

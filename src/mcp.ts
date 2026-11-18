@@ -1,6 +1,6 @@
-import type { CallJob } from "./call-job";
-import { job, registry, startJob, waitForTurn } from "./jobs";
-import type { Env } from "./types";
+import type { CallJob } from "./call-job.ts";
+import { job, registry, startJob, waitForTurn } from "./jobs.ts";
+import type { Env } from "./types.ts";
 
 // Minimal stateless MCP server (Streamable HTTP, JSON responses only).
 const INSTRUCTIONS = `Make phone calls with a voice agent that sounds like a person.
