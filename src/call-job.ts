@@ -1,12 +1,11 @@
 import { DurableObject } from "cloudflare:workers";
 import { callerInstructions, callerTools, simulatedCalleeInstructions, summaryPrompt } from "./prompt.ts";
-import { Downsampler3x1, bytesToPcm16, mulawToPcm16, pcm16ToBytes, pcm16ToMulaw } from "./audio.ts";
-import { apiKey, acceptCall, summaryConfig, deepgramSettings, googleSettings, googleWsUrl, isMediaStreamProvider, providerDefault, providerOf, realtimeCallUrl, realtimeWsUrl, sipUri, defaultVoice, type VoiceProviderName } from "./providers.ts";
+import { MS_PER_CHAR } from "./audio.ts";
+import { MediaRelay } from "./media-relay.ts";
+import { apiKey, acceptCall, summaryConfig, isMediaStreamProvider, providerDefault, providerOf, realtimeCallUrl, realtimeWsUrl, sipUri, defaultVoice, type VoiceProviderName } from "./providers.ts";
 import type { Env, Job, JobEvent, JobStatus, Question, Report } from "./types.ts";
 
 const TERMINAL = new Set(["completed", "busy", "no-answer", "failed", "canceled"]);
-// Rough speaking rate, used to wait for the goodbye to finish playing before hanging up.
-const MS_PER_CHAR = 70;
 
 export interface StartInput {
   id: string;
@@ -27,25 +26,14 @@ type Answer = { question: string; answer: string | null; note?: string };
 const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, Math.round(n)));
 const xml = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 const send = (ws: WebSocket | null, msg: unknown) => ws?.send(JSON.stringify(msg));
-const b64encode = (bytes: Uint8Array) => {
-  let s = "";
-  for (const b of bytes) s += String.fromCharCode(b);
-  return btoa(s);
-};
-const b64decode = (s: string) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
 
 // One phone call: dials through Twilio, runs the Grok voice session, collects questions and the transcript.
 export class CallJob extends DurableObject<Env> {
   job: Job | null = null;
   agent: WebSocket | null = null;
   sim: WebSocket | null = null;
-  // Media-stream pipeline (deepgram, google): Twilio <-> this DO <-> provider.
-  twilioWs: WebSocket | null = null;
-  streamSid: string | null = null;
-  providerWs: WebSocket | null = null;
-  downsampler: Downsampler3x1 | null = null;
-  settingsApplied = false;
-  prebuffer: Uint8Array[] = [];
+  // Media-stream pipeline (deepgram, google): owned by media-relay.ts, composed here.
+  private readonly relay = new MediaRelay(this, this.env, this.ctx);
   // A check_messages call whose response is held until the principal answers an open question.
   pendingCheck: { id: string; name: string } | null = null;
   responseActive = false;
@@ -68,6 +56,22 @@ export class CallJob extends DurableObject<Env> {
     });
   }
 
+  // Media-stream helpers called by MediaRelay.
+  async markAttached() {
+    if (this.job) await this.registry().update(this.job.id, { attached: true });
+  }
+
+  noteAgentText(text: string) {
+    this.emit("said", { who: "agent", text });
+    this.audioEndsAt = Math.max(this.audioEndsAt, Date.now() + text.length * MS_PER_CHAR);
+  }
+
+  noteAgentAudioDone() {
+    this.userSpeaking = false;
+    this.audioEndsAt = Date.now();
+    if (this.hangupPending) this.scheduleHangup();
+  }
+
   private registry() {
     return this.env.REGISTRY.get(this.env.REGISTRY.idFromName("main"));
   }
@@ -76,7 +80,7 @@ export class CallJob extends DurableObject<Env> {
     await this.ctx.storage.put("job", this.job);
   }
 
-  private emit(type: string, data: Record<string, unknown> = {}) {
+  emit(type: string, data: Record<string, unknown> = {}) {
     this.ctx.storage.sql.exec(`INSERT INTO events (at, type, data) VALUES (?, ?, ?)`, Date.now(), type, JSON.stringify(data));
     for (const wake of this.waiters) wake();
     this.waiters.clear();
@@ -212,297 +216,14 @@ export class CallJob extends DurableObject<Env> {
   }
 
   // Twilio <Connect><Stream> opens a bidirectional WebSocket to /twilio/media/<job-id>.
-  // This Worker is the media relay for the media-stream providers: mulaw/8kHz both ways.
+  // This Worker is the media relay for the media-stream providers (see media-relay.ts).
   async fetch(request: Request): Promise<Response> {
     if (!this.job) return new Response("unknown job", { status: 404 });
     const provider = providerOf(this.job, this.env);
     if (!isMediaStreamProvider(provider)) return new Response("unknown job", { status: 404 });
-    if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") return new Response("expected websocket upgrade", { status: 426 });
-    const env = this.env;
-    const pair = new WebSocketPair();
-    const [client, server] = Object.values(pair);
-    this.twilioWs = server as unknown as WebSocket;
-    server.accept();
-    server.addEventListener("message", (m: { data: string | ArrayBuffer }) => this.onTwilioEvent(m));
-    server.addEventListener("close", () => {
-      this.twilioWs = null;
-      this.streamSid = null;
-    });
-
-    const res =
-      provider === "google"
-        ? await fetch(googleWsUrl(env), { headers: { Upgrade: "websocket" } })
-        : await fetch("wss://agent.deepgram.com/v1/agent/converse", {
-            headers: { Upgrade: "websocket", Authorization: `Token ${env.DEEPGRAM_API_KEY}` },
-          });
-    const dg = res.webSocket;
-    if (!dg) {
-      const detail = (await res.text()).slice(0, 200);
-      this.emit("error", { message: `${provider} connect failed: ${res.status} ${detail}` });
-      server.close(1011, "provider connect failed");
-      return new Response(`${provider} connect failed`, { status: 502 });
-    }
-    this.providerWs = dg;
-    dg.accept();
-    if (provider === "google") {
-      this.downsampler = new Downsampler3x1();
-      try {
-        send(dg, googleSettings(env, this.job!));
-      } catch (err) {
-        this.emit("error", { message: `google configuration invalid: ${String(err).slice(0, 200)}` });
-        server.close(1011, "bad setup");
-        dg.close(1000, "bad setup");
-        return new Response("google configuration invalid", { status: 502 });
-      }
-    }
-    dg.addEventListener("message", (m: { data: string | ArrayBuffer }) => (provider === "google" ? this.onGoogleEvent(m) : this.onDeepgramEvent(m)));
-    dg.addEventListener("close", (e: { code: number }) => {
-      this.providerWs = null;
-      this.settingsApplied = false;
-      this.emit("status", { status: "voice_session_closed", code: e.code });
-      // If the provider dropped first (crash, session limit), hang up the phone leg too —
-      // otherwise the callee is stuck on a silent line until Twilio's TimeLimit.
-      if (this.twilioWs && this.job && this.job.status !== "done" && this.job.status !== "ended") this.ctx.waitUntil(this.endCall());
-    });
-    await this.registry().update(this.job.id, { attached: true });
-    this.emit("debug", { media: `twilio<->${provider}` });
-    return new Response(null, { status: 101, webSocket: client });
+    return this.relay.acceptTwilio(request);
   }
 
-  private toTwilio(msg: Record<string, unknown>) {
-    send(this.twilioWs, msg);
-  }
-
-  private onTwilioEvent(m: { data: string | ArrayBuffer }) {
-    if (typeof m.data !== "string") return;
-    let msg: any;
-    try {
-      msg = JSON.parse(m.data);
-    } catch {
-      return;
-    }
-    switch (msg.event) {
-      case "connected":
-        break;
-      case "start":
-        this.streamSid = msg.start?.streamSid ?? msg.streamSid ?? null;
-        this.emit("debug", { media_stream_sid: this.streamSid });
-        break;
-      case "media": {
-        const payload = msg.media?.payload;
-        if (typeof payload !== "string") break;
-        const bytes = b64decode(payload);
-        if (this.providerWs && this.settingsApplied) this.sendAudioToProvider(bytes);
-        else if (this.prebuffer.length < 200) this.prebuffer.push(bytes);
-        break;
-      }
-      case "dtmf":
-        this.emit("dtmf", { digit: msg.dtmf?.digit });
-        break;
-      case "mark":
-        break;
-      case "stop":
-        try {
-          this.providerWs?.close(1000, "call ended");
-        } catch {}
-        this.providerWs = null;
-        this.downsampler = null;
-        break;
-    }
-  }
-
-  // Twilio audio (mulaw/8kHz) -> provider-native framing.
-  private sendAudioToProvider(mulaw: Uint8Array) {
-    if (!this.providerWs) return;
-    if (providerOf(this.job, this.env) === "google") {
-      // Declare rate=8000 and let Gemini resample; just decode mulaw -> PCM16 LE.
-      const pcm = mulawToPcm16(mulaw);
-      send(this.providerWs, { realtimeInput: { audio: { data: b64encode(pcm16ToBytes(pcm)), mimeType: "audio/pcm;rate=8000" } } });
-      return;
-    }
-    this.providerWs.send(mulaw.buffer as ArrayBuffer);
-  }
-
-  private onDeepgramEvent(m: { data: string | ArrayBuffer }) {
-    // Binary frames are the agent's voice (mulaw/8kHz): pipe them to the caller unchanged.
-    if (m.data instanceof ArrayBuffer) {
-      if (this.twilioWs && this.streamSid) this.toTwilio({ event: "media", streamSid: this.streamSid, media: { payload: b64encode(new Uint8Array(m.data)) } });
-      return;
-    }
-    let e: any;
-    try {
-      e = JSON.parse(String(m.data));
-    } catch {
-      return;
-    }
-    switch (e.type) {
-      case "Welcome": {
-        try {
-          send(this.providerWs!, deepgramSettings(this.env, this.job!));
-        } catch (err) {
-          this.emit("error", { message: `deepgram configuration invalid: ${String(err).slice(0, 200)}` });
-          try {
-            this.twilioWs?.close(1011, "bad settings");
-          } catch {}
-          try {
-            this.providerWs?.close(1000, "bad settings");
-          } catch {}
-        }
-        break;
-      }
-      case "SettingsApplied":
-        this.settingsApplied = true;
-        for (const bytes of this.prebuffer) this.sendAudioToProvider(bytes);
-        this.prebuffer = [];
-        break;
-      case "Settings":
-      case "SettingsError":
-      case "UnhandledClientMessage":
-        if (e.type === "SettingsError") {
-          this.emit("error", { message: `deepgram rejected Settings: ${JSON.stringify(e).slice(0, 300)}` });
-          try {
-            this.twilioWs?.close(1011, "settings failed");
-          } catch {}
-        } else this.emit("debug", { deepgram_event: e.type, detail: e.description ?? String(e).slice(0, 200) });
-        break;
-      case "ConversationText": {
-        const text = typeof e.content === "string" ? e.content.trim() : "";
-        if (!text) break;
-        if (e.role === "user") this.emit("said", { who: "them", text });
-        else if (e.role === "assistant") {
-          this.emit("said", { who: "agent", text });
-          this.audioEndsAt = Math.max(this.audioEndsAt, Date.now() + text.length * MS_PER_CHAR);
-        }
-        break;
-      }
-      case "UserStartedSpeaking":
-        this.userSpeaking = true;
-        // Barge-in: stop any buffered agent audio on the call right away.
-        if (this.twilioWs && this.streamSid) this.toTwilio({ event: "clear", streamSid: this.streamSid });
-        break;
-      case "AgentThinking":
-      case "ConversationTextDone":
-        break;
-      case "AgentAudioDone":
-        this.userSpeaking = false;
-        this.audioEndsAt = Date.now();
-        if (this.hangupPending) this.scheduleHangup();
-        break;
-      case "FunctionCallRequest":
-        for (const fc of e.functions ?? []) {
-          if (fc.client_side === false) {
-            this.emit("debug", { server_side_function: fc.name });
-            continue;
-          }
-          this.onTool(fc.name, fc.id, typeof fc.arguments === "string" ? fc.arguments : JSON.stringify(fc.arguments ?? {}));
-        }
-        break;
-      case "FunctionCallCancelled":
-        for (const fc of e.functions ?? []) {
-          if (this.pendingCheck?.id === fc.id) this.pendingCheck = null;
-        }
-        break;
-      case "Error":
-        this.emit("error", { message: e.description ?? e.message ?? JSON.stringify(e).slice(0, 300) });
-        break;
-      case "Warning":
-        this.emit("debug", { deepgram_warning: e.description ?? String(e).slice(0, 200) });
-        break;
-      default:
-        if (!this.seenTypes.has(e.type)) {
-          this.seenTypes.add(e.type);
-          this.emit("debug", { deepgram_event: e.type });
-        }
-    }
-  }
-
-  // Gemini Live message surface (setupComplete, serverContent, toolCall, toolCallCancellation).
-  private onGoogleEvent(m: { data: string | ArrayBuffer }) {
-    if (typeof m.data !== "string") return; // Gemini sends only JSON text frames
-    let e: any;
-    try {
-      e = JSON.parse(m.data);
-    } catch {
-      return;
-    }
-    if (e.setupComplete !== undefined) {
-      this.settingsApplied = true;
-      for (const bytes of this.prebuffer) this.sendAudioToProvider(bytes);
-      this.prebuffer = [];
-      return;
-    }
-    if (e.toolCall) {
-      for (const fc of e.toolCall.functionCalls ?? []) {
-        this.onTool(fc.name, fc.id, JSON.stringify(fc.args ?? {}));
-      }
-      return;
-    }
-    if (e.toolCallCancellation) {
-      for (const id of e.toolCallCancellation.ids ?? []) {
-        if (this.pendingCheck?.id === id) this.pendingCheck = null;
-      }
-      return;
-    }
-    if (e.error) {
-      this.emit("error", { message: `google: ${e.error.message ?? JSON.stringify(e.error).slice(0, 300)}` });
-      return;
-    }
-    const sc = e.serverContent;
-    if (sc) {
-      // The callee's audio arrives base64-encoded as 24kHz PCM16 inside the model turn.
-      if (sc.modelTurn?.parts) {
-        for (const part of sc.modelTurn.parts) {
-          const b64 = part?.inlineData?.data;
-          if (typeof b64 !== "string") continue;
-          const pcm = bytesToPcm16(b64decode(b64));
-          if (!this.downsampler) this.downsampler = new Downsampler3x1();
-          const pcm8k = this.downsampler.process(pcm);
-          const mulaw = pcm16ToMulaw(pcm8k);
-          if (this.twilioWs && this.streamSid) {
-            this.toTwilio({ event: "media", streamSid: this.streamSid, media: { payload: b64encode(mulaw) } });
-          }
-        }
-      }
-      // VAD interruption: the callee started talking over the agent — stop playback now.
-      if (sc.interrupted === true) {
-        this.userSpeaking = true;
-        if (this.twilioWs && this.streamSid) this.toTwilio({ event: "clear", streamSid: this.streamSid });
-      }
-      if (sc.inputTranscription?.text) {
-        // Gemini sends transcription deltas per message (same order as audio), like the SDK examples log them.
-        const text = String(sc.inputTranscription.text).trim();
-        if (text) this.emit("said", { who: "them", text });
-      }
-      if (sc.outputTranscription?.text) {
-        const text = String(sc.outputTranscription.text).trim();
-        if (text) {
-          this.emit("said", { who: "agent", text });
-          this.audioEndsAt = Math.max(this.audioEndsAt, Date.now() + text.length * MS_PER_CHAR);
-        }
-      }
-      if (sc.turnComplete) {
-        this.userSpeaking = false;
-        this.audioEndsAt = Date.now();
-        if (this.hangupPending) this.scheduleHangup();
-      }
-      return;
-    }
-    if (e.usageMetadata) return; // noise; could feed cost tracking later
-    if (!this.seenTypes.has(e.type ?? "unknown")) {
-      this.seenTypes.add(e.type ?? "unknown");
-      this.emit("debug", { google_event: e.type ?? Object.keys(e)[0] });
-    }
-  }
-
-  // Tool responses: the agent continues the turn once it receives this message.
-  private providerToolOutput(fc: { id: string; name: string }, result: unknown) {
-    if (providerOf(this.job!, this.env) === "google") {
-      const response = typeof result === "object" && result !== null && !Array.isArray(result) ? result : { result };
-      send(this.providerWs, { toolResponse: { functionResponses: [{ id: fc.id, name: fc.name, response }] } });
-      return;
-    }
-    send(this.providerWs, { type: "FunctionCallResponse", id: fc.id, name: fc.name, content: JSON.stringify(result) });
-  }
 
   async attach(callId: string, role: "agent" | "sim", sipHeaders: string[]): Promise<{ ok: true } | { error: string }> {
     if (isMediaStreamProvider(providerOf(this.job, this.env))) return { error: "this provider uses Twilio media streams, not SIP attach" };
@@ -698,23 +419,23 @@ export class CallJob extends DurableObject<Env> {
     }
   }
 
-  private onTool(name: string, callId: string, argsJson: string) {
+  onTool(name: string, callId: string, argsJson: string) {
     const job = this.job!;
     const provider = providerOf(job, this.env);
     const isMedia = isMediaStreamProvider(provider);
-    // SIP providers need a function_call_output (+ sometimes response.create); deepgram takes one
-    // FunctionCallResponse per request id and continues the turn by itself.
+    // SIP providers need a function_call_output (+ sometimes response.create); the media-stream
+    // providers take one response per request id and continue the turn by themselves.
     const out = (result: unknown, respond: boolean) =>
-      isMedia ? this.providerToolOutput({ id: callId, name }, result) : this.output(callId, result, respond);
+      isMedia ? this.relay.toolResponse({ id: callId, name }, result) : this.output(callId, result, respond);
     let args: Record<string, string> = {};
     try {
       args = JSON.parse(argsJson || "{}");
     } catch {}
     switch (name) {
       case "send_dtmf":
-        // xAI sends the tones itself; deepgram has no way to inject tones mid-stream.
+        // xAI sends the tones itself; the media-stream providers have no way to inject tones mid-stream.
         this.emit("dtmf", args);
-        if (isMedia) out({ note: "DTMF isn't supported on the deepgram provider. Say you can't press the keys and ask for a person instead." }, false);
+        if (isMedia) out({ note: "DTMF isn't supported on this provider. Say you can't press the keys and ask for a person instead." }, false);
         return;
       case "request_input": {
         const id = `q${this.questions().length + 1}`;
@@ -765,10 +486,10 @@ export class CallJob extends DurableObject<Env> {
   private flush() {
     if (!this.job) return;
     if (isMediaStreamProvider(providerOf(this.job, this.env))) {
-      // Deepgram can't be given a synthetic tool call; answer a check_messages we're holding open instead.
+      // The media providers can't be given a synthetic tool call; answer a check_messages we're holding open instead.
       if (this.pendingCheck && this.queue.length) {
         const answers = this.queue.splice(0);
-        this.providerToolOutput(this.pendingCheck, { answers });
+        this.relay.toolResponse(this.pendingCheck, { answers });
         this.pendingCheck = null;
       }
       return;
@@ -795,24 +516,10 @@ export class CallJob extends DurableObject<Env> {
     setTimeout(() => this.ctx.waitUntil(this.endCall()), wait);
   }
 
-  private async endCall() {
+  async endCall() {
     const job = this.job;
     if (!job) return;
-    if (isMediaStreamProvider(providerOf(job, this.env))) {
-      // Twilio REST hangup (below) is the signalling path; closing the bridge triggers Twilio 'stop'.
-      for (const ws of [this.providerWs, this.twilioWs]) {
-        try {
-          ws?.close(1000, "call ended");
-        } catch {}
-      }
-      this.providerWs = null;
-      this.twilioWs = null;
-      this.settingsApplied = false;
-      this.prebuffer = [];
-      this.pendingCheck = null;
-      this.streamSid = null;
-      this.downsampler = null;
-    }
+    if (isMediaStreamProvider(providerOf(job, this.env))) this.relay.close();
     if (job.xaiCallId) {
       const provider = providerOf(job, this.env);
       const res = await fetch(realtimeCallUrl(provider, job.xaiCallId, "hangup"), {
@@ -845,13 +552,13 @@ export class CallJob extends DurableObject<Env> {
       job.endedAt = Date.now();
       this.setStatus("ended", { reason });
       if (this.openerTimer) clearTimeout(this.openerTimer);
-      for (const ws of [this.agent, this.sim, this.providerWs, this.twilioWs]) {
+      for (const ws of [this.agent, this.sim]) {
         try {
           ws?.close(1000, "call ended");
         } catch {}
       }
-      this.agent = this.sim = this.providerWs = this.twilioWs = null;
-      this.downsampler = null;
+      this.relay.close();
+      this.agent = this.sim = null;
       this.ctx.storage.sql.exec(`UPDATE questions SET status = 'timed_out' WHERE status = 'pending'`);
       job.report = await this.summarize(reason);
       await this.save();

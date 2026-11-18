@@ -84,3 +84,17 @@ export function bytesToPcm16(bytes: Uint8Array): Int16Array {
   for (let i = 0; i < n; i++) out[i] = (bytes[i * 2] | (bytes[i * 2 + 1] << 8)) << 16 >> 16;
   return out;
 }
+
+// ---- base64 (no Buffer dependency, works in Workers and Node) ----
+export function b64encode(bytes: Uint8Array): string {
+  let s = "";
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s);
+}
+
+export function b64decode(s: string): Uint8Array {
+  return Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+}
+
+// Rough speaking rate, used to wait for the goodbye to finish playing before hanging up.
+export const MS_PER_CHAR = 70;
