@@ -137,6 +137,7 @@ Notes:
 
 | Command | What it does |
 | --- | --- |
+| `phonecall ui` | Interactive menu: pick a provider (google/deepgram/openai/xai), make a call, watch it, reply, report, list, hang up |
 | `phonecall call <number> --brief "…"` | Starts a call. Add `--watch` to follow it live |
 | `phonecall watch <job>` | Prints progress, then exits with one JSON line: a question to answer, or the final report |
 | `phonecall reply <job> <question-id> "…"` | Answers a question |
@@ -144,6 +145,8 @@ Notes:
 | `phonecall transcript <job>` | Shows the transcript as plain text |
 | `phonecall list` | Lists recent calls |
 | `phonecall hangup <job>` | Ends a call now |
+
+Running bare `phonecall` with no arguments opens the same menu when stdout is a terminal; otherwise it prints the help text.
 
 `call` also takes these options:
 

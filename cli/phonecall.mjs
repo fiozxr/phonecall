@@ -4,10 +4,12 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
+import { createInterface } from "node:readline/promises";
 
 const HELP = `phonecall: have a voice agent make a phone call for you
 
   phonecall call <+number> --brief "<what to get done>"   start a call, print its job id
+  phonecall ui                                          interactive menu: pick a provider, make a call, watch it, reply
   phonecall watch <job>                                  wait for the next question or the end of the call
   phonecall reply <job> <question-id> "<answer>"         answer a question while the call is live
   phonecall report <job>                                 summary, questions and transcript (JSON)
@@ -25,6 +27,8 @@ call options
   --simulate <persona>     test call: a second AI plays the person you're calling; nobody is dialed (xai only)
   --provider <name>        which voice provider runs the call: xai (default), openai, deepgram or google
   --watch                  start watching right away
+
+Running bare phonecall with no arguments opens the interactive menu (same as "phonecall ui") when stdout is a terminal.
 
 watch prints live progress to stderr and exits with one JSON line on stdout:
   {"type":"input_request","job_id":…,"question_id":"q1","question":"…"}  reply, then watch again
@@ -104,6 +108,198 @@ async function watch(jobId, verbose) {
   }
 }
 
+// ---------- interactive terminal UI (phonecall ui) ----------
+const color = process.stdout.isTTY ? (code, s) => `\x1b[${code}m${s}\x1b[0m` : (_code, s) => s;
+const dim = (s) => color(2, s);
+const bold = (s) => color(1, s);
+const cyan = (s) => color(36, s);
+const green = (s) => color(32, s);
+
+async function menu(rl, title, items) {
+  console.error(`\n${bold(title)}`);
+  items.forEach((item, i) => console.error(`  ${cyan(String(i + 1))}  ${item}`));
+  console.error(`  ${dim("0  back")}`);
+  for (;;) {
+    const raw = (await rl.question(cyan("> "))).trim();
+    const n = Number(raw);
+    if (raw === "0" || raw === "") return null;
+    if (Number.isInteger(n) && n >= 1 && n <= items.length) return n - 1;
+    console.error(dim("  enter a number from the list (0 to go back)"));
+  }
+}
+
+async function askJob(rl, message = "Job id") {
+  let def = "";
+  try {
+    const recent = await api("GET", "/jobs?limit=1");
+    if (Array.isArray(recent) && recent[0]) def = recent[0].id;
+  } catch {}
+  const job = (await rl.question(`${message}${def ? dim(` (enter for ${def})`) : ""}: `)).trim() || def;
+  return job || null;
+}
+
+const PROVIDERS = [
+  { label: "google  — Gemini Live API, free tier", value: "google" },
+  { label: "deepgram — Flux STT/TTS + your own LLM (BYO endpoint/local model)", value: "deepgram" },
+  { label: "openai  — GPT Realtime (your OpenAI key)", value: "openai" },
+  { label: "xai     — Grok Voice (default)", value: "xai" },
+  { label: "server default — whatever VOICE_PROVIDER is set to", value: undefined },
+];
+
+async function uiCall(rl) {
+  const pick = await menu(rl, "Which provider runs the call?", PROVIDERS.map((p) => p.label));
+  if (pick === null) return;
+  const provider = PROVIDERS[pick].value;
+
+  let to, simulatePersona;
+  if (provider === "xai") {
+    const s = (await rl.question("Simulate a test call (a second AI plays the other side; nobody is dialed)? [y/N] ")).trim().toLowerCase();
+    if (s === "y") {
+      simulatePersona = (await rl.question("Persona for the other side (e.g. the counter at a busy pizza place): ")).trim();
+    }
+  }
+  if (!simulatePersona) {
+    to = (await rl.question("Number to call (E.164, like +14155550100): ")).trim();
+    if (!/^\+[1-9]\d{7,14}$/.test(to)) {
+      console.error(dim("  not E.164 — cancelled"));
+      return;
+    }
+  }
+  const brief = (await rl.question(`Brief — the goal, facts it may share, limits, what counts as done:\n${cyan("> ")}`)).trim();
+  if (!brief) {
+    console.error(dim("  empty brief — cancelled"));
+    return;
+  }
+  const forWhom = (await rl.question("Who is the call for? (enter to use the server default): ")).trim();
+  const minutesRaw = (await rl.question("Hard limit on minutes? (enter=10): ")).trim();
+  console.error(dim("  dialing…"));
+  let r;
+  try {
+    r = await api("POST", "/jobs", {
+      to,
+      brief,
+      principal: forWhom || undefined,
+      max_minutes: minutesRaw ? Number(minutesRaw) : undefined,
+      simulate: simulatePersona,
+      provider,
+    });
+  } catch (err) {
+    console.error(dim("  could not start the call (see the error above)."));
+    return;
+  }
+  console.error(`${green("✓")} started ${r.job_id}`);
+  out({ job_id: r.job_id, next: `phonecall watch ${r.job_id}` });
+  const go = (await rl.question("Watch it now? [Y/n] ")).trim().toLowerCase();
+  if (go !== "n") await watch(r.job_id, false);
+}
+
+async function uiWatch(rl) {
+  const job = await askJob(rl, "Job to watch");
+  if (job) await watch(job, false);
+}
+
+async function uiReply(rl) {
+  const job = await askJob(rl, "Job id");
+  if (!job) return;
+  let r;
+  try {
+    r = await api("GET", `/jobs/${job}`);
+  } catch {
+    console.error(dim("  unknown job"));
+    return;
+  }
+  const pending = (r.questions ?? []).filter((q) => q.status === "pending");
+  if (!pending.length) {
+    console.error(dim("  no pending questions right now"));
+    return;
+  }
+  pending.forEach((q, i) => console.error(`  ${cyan(String(i + 1))}  ${q.question}`));
+  const raw = (await rl.question(cyan("> "))).trim();
+  const idx = Number(raw);
+  if (!Number.isInteger(idx) || idx < 1 || idx > pending.length) {
+    console.error(dim("  cancelled"));
+    return;
+  }
+  const answer = (await rl.question(`Your answer to "${pending[idx - 1].question}":\n${cyan("> ")}`)).trim();
+  if (!answer) {
+    console.error(dim("  empty answer — cancelled"));
+    return;
+  }
+  out(await api("POST", `/jobs/${job}/reply`, { question_id: pending[idx - 1].id, answer }));
+}
+
+async function uiReport(rl) {
+  const job = await askJob(rl, "Job id");
+  if (!job) return;
+  let r;
+  try {
+    r = await api("GET", `/jobs/${job}`);
+  } catch {
+    console.error(dim("  unknown job"));
+    return;
+  }
+  const { job: j, questions, transcript } = r;
+  if (j?.report) {
+    console.error(`\n${bold("Outcome:")} ${j.report.outcome}`);
+    console.error(`${bold("Summary:")} ${j.report.summary}`);
+    for (const [k, v] of Object.entries(j.report.details ?? {})) console.error(`  ${k}: ${v}`);
+    for (const c of j.report.commitments ?? []) console.error(`  commitment: ${c}`);
+    for (const f of j.report.follow_ups ?? []) console.error(`  follow-up: ${f}`);
+  } else {
+    console.error(`${bold("Status:")} ${j?.status ?? "?"} — no report yet (call not finished)`);
+  }
+  if (questions?.length) {
+    console.error(`\n${bold("Questions")}`);
+    for (const q of questions) console.error(`  ${q.id} [${q.status}] ${q.question}${q.answer ? `\n      → ${q.answer}` : ""}`);
+  }
+  if (transcript?.length) {
+    console.error(`\n${bold("Transcript")}`);
+    for (const t of transcript) console.error(`  [${time(t.at)}] ${t.who === "agent" ? j.agentName ?? "agent" : "Them"}: ${t.text}`);
+  }
+}
+
+async function uiList() {
+  for (const j of await api("GET", "/jobs?limit=10")) {
+    console.log(`${j.id}  ${new Date(j.created_at).toLocaleString()}  ${j.status.padEnd(9)} ${j.to}  ${j.brief.split("\n")[0].slice(0, 60)}`);
+  }
+}
+
+async function uiHangup(rl) {
+  const job = await askJob(rl, "Job to hang up");
+  if (job) out(await api("POST", `/jobs/${job}/hangup`));
+}
+
+async function ui() {
+  if (!process.stdout.isTTY) fail("phonecall ui needs a terminal (stdout is not a TTY)");
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  console.error(`\n${bold("phonecall")} ${dim("— place a phone call from your terminal")}`);
+  try {
+    for (;;) {
+      const pick = await menu(rl, "What would you like to do?", [
+        "make a call",
+        "watch a live call",
+        "answer a pending question (reply)",
+        "report / transcript",
+        "recent calls",
+        "hang up a call",
+      ]);
+      if (pick === null) break;
+      if (pick === 0) await uiCall(rl);
+      else if (pick === 1) await uiWatch(rl);
+      else if (pick === 2) await uiReply(rl);
+      else if (pick === 3) await uiReport(rl);
+      else if (pick === 4) await uiList();
+      else if (pick === 5) await uiHangup(rl);
+    }
+  } catch (err) {
+    // stdin closed mid-question (Ctrl-D or piped input ran out): leave quietly, don't crash.
+    if (err?.code !== "ABORT_ERR") throw err;
+  } finally {
+    rl.close();
+    console.error(dim("bye.\n"));
+  }
+}
+
 const [cmd, ...rest] = process.argv.slice(2);
 const { values: opt, positionals: pos } = parseArgs({
   args: rest,
@@ -146,6 +342,9 @@ switch (cmd) {
     } else out({ job_id: r.job_id, next: `phonecall watch ${r.job_id}` });
     break;
   }
+  case "ui":
+    await ui();
+    break;
   case "watch":
     if (!pos[0]) fail("usage: phonecall watch <job>");
     await watch(pos[0], opt.verbose);
@@ -172,6 +371,10 @@ switch (cmd) {
     out(await api("POST", `/jobs/${pos[0]}/hangup`));
     break;
   default:
+    if (!cmd && process.stdout.isTTY) {
+      await ui();
+      break;
+    }
     console.log(HELP);
     if (cmd && cmd !== "help" && cmd !== "--help" && cmd !== "-h") process.exit(1);
 }
